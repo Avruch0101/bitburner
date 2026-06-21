@@ -68,8 +68,19 @@ export async function main(ns) {
             const bestMoney = harvest.length ? ns.getServerMaxMoney(harvest[0]) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
                              .slice(0, numTargets + STICKY_EXTRA);
-            // focus = best unprepped server in top (the new cold target to dig with surplus)
-            const focus = top.find(t => !preppedSet.has(t)) || null;
+            // focus selection:
+            //  - with no earners yet, bootstrap the FASTEST-to-prep eligible server so income
+            //    starts in seconds instead of waiting on the richest cold target ($0 gap cure)
+            //  - once something is earning, dig the richest unprepped target with surplus
+            let focus;
+            if (harvest.length === 0) {
+                const cold = eligible.filter(t => !preppedSet.has(t));
+                focus = cold.length
+                    ? cold.reduce((a, b) => prepCost(ns, b) < prepCost(ns, a) ? b : a)
+                    : null;
+            } else {
+                focus = top.find(t => !preppedSet.has(t)) || null;
+            }
 
             // --- only rebalance when the harvest set or focus changes ---
             const key = harvest.join(",") + "|" + (focus || "") + "|L" + Math.floor(L / 10);
@@ -147,4 +158,17 @@ function crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP) {
     const weakenT = Math.max(1, Math.ceil(secAdd / wpt));
     const prepT = Math.ceil((growT + weakenT) * PREP_MARGIN);
     return { hackT, prepT };
+}
+
+// Rough threads-to-prep estimate for picking the fastest bootstrap target:
+// grow threads to refill from current money + weaken threads for current security excess.
+// Lower = closer to prepped / cheaper to bring online.
+function prepCost(ns, t) {
+    const max = ns.getServerMaxMoney(t);
+    const cur = Math.max(ns.getServerMoneyAvailable(t), 1);
+    const mult = Math.min(max / cur, 1e6);                  // cap to avoid Infinity on near-empty servers
+    const growT = mult > 1 ? ns.growthAnalyze(t, mult) : 0;
+    const secExcess = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
+    const weakenT = secExcess / (ns.weakenAnalyze(1) || 0.05);
+    return growT + weakenT;
 }
