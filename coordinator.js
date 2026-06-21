@@ -6,6 +6,7 @@ export async function main(ns) {
     const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
+    const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const PREP = "prep.js", HACK = "h.js";
@@ -41,28 +42,37 @@ export async function main(ns) {
                 if (ns.fileExists("SQLInject.exe","home")) ns.sqlinject(h);
                 if (ns.getServerNumPortsRequired(h) <= have) ns.nuke(h);
             }
-            // --- pick targets (level-filtered, richest first) ---
+            // --- pick candidates (level-filtered, richest first) ---
             const L = ns.getHackingLevel();
             const maxReq = L * levelRatio;
-            const targets = all
+            const eligible = all
                 .filter(h => ns.hasRootAccess(h) && ns.getServerMaxMoney(h) > 0
                           && ns.getServerRequiredHackingLevel(h) <= maxReq)
-                .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a))
-                .slice(0, numTargets);
+                .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
+            const top = eligible.slice(0, numTargets);
 
-            // --- classify with hysteresis ---
-            for (const t of targets) {
+            // --- classify with hysteresis over top + already-prepped (keeps sticky earners fresh) ---
+            const watch = new Set(top);
+            for (const t of preppedSet) watch.add(t);
+            for (const t of watch) {
+                if (!ns.hasRootAccess(t) || ns.getServerMaxMoney(t) <= 0) { preppedSet.delete(t); continue; }
                 const m = ns.getServerMoneyAvailable(t) / ns.getServerMaxMoney(t);
                 const s = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
                 if (!preppedSet.has(t)) { if (m >= ENTER && s <= 2) preppedSet.add(t); }
                 else { if (m < EXIT) preppedSet.delete(t); }
             }
-            const done  = targets.filter(t => preppedSet.has(t));
-            const todo  = targets.filter(t => !preppedSet.has(t));
-            const focus = todo[0] || null;
 
-            // --- only rebalance when the prepped set or focus changes ---
-            const key = done.join(",") + "|" + (focus || "") + "|L" + Math.floor(L / 10);
+            // harvest = currently-prepped servers, sticky even if bumped out of top-N;
+            // richest-first, value-floored, capped so we don't spread too thin
+            let harvest = [...preppedSet].sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
+            const bestMoney = harvest.length ? ns.getServerMaxMoney(harvest[0]) : 0;
+            harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
+                             .slice(0, numTargets + STICKY_EXTRA);
+            // focus = best unprepped server in top (the new cold target to dig with surplus)
+            const focus = top.find(t => !preppedSet.has(t)) || null;
+
+            // --- only rebalance when the harvest set or focus changes ---
+            const key = harvest.join(",") + "|" + (focus || "") + "|L" + Math.floor(L / 10);
             if (key !== lastKey) {
                 lastKey = key;
 
@@ -81,19 +91,15 @@ export async function main(ns) {
                 pool.sort((a, b) => b.free - a.free);
                 const total = pool.reduce((s, r) => s + r.free, 0);
 
-                // dynamic crews: size each prepped target from its own economics
+                // dynamic crews: size each harvested target from its own economics
                 const HACK_CAP = Math.max(1, Math.floor(total * 0.20));   // no single target hogs >20% of pool on hack
-                // value floor: only harvest targets worth a real fraction of the richest one
-                const bestMoney = done.length ? Math.max(...done.map(t => ns.getServerMaxMoney(t))) : 0;
-                const worthy = done.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney);
-                const skipped = done.filter(t => !worthy.includes(t));
                 const crews = {};
-                for (const t of worthy) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
+                for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
                 // pass 1: hack threads first (income drivers), richest target first
-                for (const t of worthy) place(ns, pool, HACK, crews[t].hackT, t);
+                for (const t of harvest) place(ns, pool, HACK, crews[t].hackT, t);
                 // pass 2: prep to refill the skim
-                for (const t of worthy) place(ns, pool, PREP, crews[t].prepT, t);
-                // pass 3: surplus -> focus prep, or cascade extra prep onto richest targets first (capped)
+                for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
+                // pass 3: surplus -> focus prep (dig the new target), else cascade extra prep onto richest earners
                 if (focus) {
                     const left = pool.reduce((s, r) => s + r.free, 0);
                     const fc = crewFor(ns, focus, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
@@ -101,15 +107,14 @@ export async function main(ns) {
                     place(ns, pool, HACK, seed, focus);
                     place(ns, pool, PREP, left - seed, focus);
                 } else {
-                    // richest-first: give each worthy target up to 2x its base prep, then stop
-                    for (const t of worthy) place(ns, pool, PREP, crews[t].prepT * 2, t);
+                    // richest-first: give each earner up to 2x its base prep, then stop
+                    for (const t of harvest) place(ns, pool, PREP, crews[t].prepT * 2, t);
                 }
                 const idle = pool.reduce((s, r) => s + r.free, 0);
 
-                const crewStr = worthy.map(t => t + "(h" + crews[t].hackT + "/p" + crews[t].prepT + ")").join(" ");
+                const crewStr = harvest.map(t => t + "(h" + crews[t].hackT + "/p" + crews[t].prepT + ")").join(" ");
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
                     + "  dig " + (focus || "(none)")
-                    + (skipped.length ? "  skip " + skipped.length + " low-value" : "")
                     + "  pool " + total + "t" + (idle > 0 ? "  idle " + idle + "t (raise targets/ratio)" : ""));
             }
         } catch (e) {
