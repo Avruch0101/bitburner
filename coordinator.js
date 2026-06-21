@@ -3,8 +3,8 @@ export async function main(ns) {
     const numTargets   = Number(ns.args[0]) || 6;     // max targets to bring online
     const levelRatio   = Number(ns.args[1]) || 0.5;   // target required-level <= ratio * your level
     const HOME_RESERVE = 24;     // GB kept free on home for this coordinator + diagnostics
-    const MAINT_HACK   = 20;     // hack threads on a prepped (harvesting) target (small early; raise as pool grows)
-    const MAINT_PREP   = 160;    // prep threads to refill what hack skims (keep ~8x MAINT_HACK to avoid over-hack)
+    const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
+    const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const PREP = "prep.js", HACK = "h.js";
@@ -61,7 +61,7 @@ export async function main(ns) {
             const focus = todo[0] || null;
 
             // --- only rebalance when the prepped set or focus changes ---
-            const key = done.join(",") + "|" + (focus || "");
+            const key = done.join(",") + "|" + (focus || "") + "|L" + Math.floor(L / 10);
             if (key !== lastKey) {
                 lastKey = key;
 
@@ -80,23 +80,29 @@ export async function main(ns) {
                 pool.sort((a, b) => b.free - a.free);
                 const total = pool.reduce((s, r) => s + r.free, 0);
 
-                // maintenance crews on prepped targets
-                for (const t of done) {
-                    place(ns, pool, HACK, MAINT_HACK, t);
-                    place(ns, pool, PREP, MAINT_PREP, t);
-                }
-                // bulk to the single focus target (concentrated prep + a seed of hack)
+                // dynamic crews: size each prepped target from its own economics
+                const HACK_CAP = Math.max(1, Math.floor(total * 0.20));   // no single target hogs >20% of pool on hack
+                const crews = {};
+                for (const t of done) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
+                // pass 1: hack threads first (income drivers), richest target first
+                for (const t of done) place(ns, pool, HACK, crews[t].hackT, t);
+                // pass 2: prep to refill the skim
+                for (const t of done) place(ns, pool, PREP, crews[t].prepT, t);
+                // pass 3: surplus -> focus prep, or spread as extra prep across prepped targets
                 if (focus) {
                     const left = pool.reduce((s, r) => s + r.free, 0);
-                    const seed = Math.min(MAINT_HACK, Math.floor(left * 0.1));
+                    const fc = crewFor(ns, focus, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
+                    const seed = Math.min(fc.hackT, Math.floor(left * 0.1));
                     place(ns, pool, HACK, seed, focus);
                     place(ns, pool, PREP, left - seed, focus);
                 } else if (done.length) {
                     const left = pool.reduce((s, r) => s + r.free, 0);
-                    place(ns, pool, HACK, left, done[0]);
+                    const per = Math.floor(left / done.length);
+                    for (const t of done) place(ns, pool, PREP, per, t);
                 }
 
-                ns.tprint(`coordinator @L${L}: harvesting [${done.join(", ")}]  digging ${focus || "(none)"}  pool ${total}t`);
+                const crewStr = done.map(t => t + "(h" + crews[t].hackT + "/p" + crews[t].prepT + ")").join(" ");
+                ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)") + "  dig " + (focus || "(none)") + "  pool " + total + "t");
             }
         } catch (e) {
             ns.print("loop error: " + e);
@@ -114,4 +120,18 @@ function place(ns, pool, script, threads, target) {
         const pid = ns.exec(script, r.host, n, target);
         if (pid !== 0) { r.free -= n; remaining -= n; }
     }
+}
+
+// Size a harvest crew for one target from its own hack/grow economics.
+function crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP) {
+    const perHack = ns.hackAnalyze(t);                       // fraction stolen per hack thread
+    let hackT = perHack > 0 ? Math.max(1, Math.floor(STEAL_FRAC / perHack)) : 1;
+    if (hackT > HACK_CAP) hackT = HACK_CAP;
+    const growMult = 1 / (1 - STEAL_FRAC);                   // regrow what the skim removes
+    const growT = Math.max(1, Math.ceil(ns.growthAnalyze(t, growMult)));
+    const wpt = ns.weakenAnalyze(1) || 0.05;                 // security removed per weaken thread
+    const secAdd = ns.hackAnalyzeSecurity(hackT, t) + ns.growthAnalyzeSecurity(growT, t);
+    const weakenT = Math.max(1, Math.ceil(secAdd / wpt));
+    const prepT = Math.ceil((growT + weakenT) * PREP_MARGIN);
+    return { hackT, prepT };
 }
