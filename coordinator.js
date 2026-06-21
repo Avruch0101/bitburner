@@ -3,8 +3,8 @@ export async function main(ns) {
     const numTargets   = Number(ns.args[0]) || 6;     // max targets to bring online
     const levelRatio   = Number(ns.args[1]) || 0.5;   // target required-level <= ratio * your level
     const HOME_RESERVE = 24;     // GB kept free on home for this coordinator + diagnostics
-    const MAINT_HACK   = 2;      // hack threads on a prepped (harvesting) target (small early; raise as pool grows)
-    const MAINT_PREP   = 20;     // prep threads to refill what hack skims
+    const MAINT_HACK   = 20;     // hack threads on a prepped (harvesting) target (small early; raise as pool grows)
+    const MAINT_PREP   = 160;    // prep threads to refill what hack skims (keep ~8x MAINT_HACK to avoid over-hack)
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const PREP = "prep.js", HACK = "h.js";
