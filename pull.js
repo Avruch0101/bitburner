@@ -7,7 +7,7 @@ export async function main(ns) {
     // ---------------------------------------------------
     const files = [
         "pull.js",
-        "coordinator.js", "prep.js", "h.js", "g.js", "w.js",
+        "coordinator.js", "prep.js", "h.js",
         "farm-status.js", "diagnose-income.js", "earners.js", "status.js",
         "hud.js"
     ];
