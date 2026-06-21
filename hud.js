@@ -2,10 +2,33 @@
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
-    ns.ui.resizeTail(660, 480);
+    ns.ui.resizeTail(680, 500);
     const React = globalThis.React;
+    let action = null;  // set by buttons, performed by the loop (avoids ns calls inside click handlers)
 
     while (true) {
+        // --- perform any pending button action in loop context ---
+        if (action) {
+            try {
+                if (action === "copied") {
+                    ns.toast("HUD copied to clipboard", "success", 1500);
+                } else if (action === "pull") {
+                    const pid = ns.run("pull.js");
+                    ns.toast(pid ? "running pull.js" : "pull.js not found", pid ? "info" : "error", 2500);
+                } else if (action === "puzzles") {
+                    const pid = ns.run("puzzles.js");
+                    ns.toast(pid ? "running puzzles.js" : "puzzles.js not found", pid ? "info" : "error", 2500);
+                } else if (action === "restart") {
+                    let cargs = [];
+                    for (const p of ns.ps("home")) if (p.filename === "coordinator.js") { cargs = p.args; break; }
+                    ns.scriptKill("coordinator.js", "home");
+                    const pid = ns.run("coordinator.js", 1, ...cargs);
+                    ns.toast(pid ? ("coordinator restarted " + (cargs.length ? cargs.join(" ") : "(defaults)")) : "coordinator.js not found", pid ? "success" : "error", 2500);
+                }
+            } catch (e) { ns.toast("action error: " + e, "error", 4000); }
+            action = null;
+        }
+
         // --- scan the whole network ---
         const seen = new Set(["home"]);
         const queue = ["home"];
@@ -17,13 +40,12 @@ export async function main(ns) {
             }
         }
 
-        // --- tally workers + income per target ---
+        // --- tally workers + income per target, count rooted + contracts ---
         const data = {};
-        let totalPrep = 0;
-        let totalHack = 0;
-        let rooted = 0;
+        let totalPrep = 0, totalHack = 0, rooted = 0, contracts = 0;
         for (const host of all) {
             if (ns.hasRootAccess(host)) rooted++;
+            try { contracts += ns.ls(host, ".cct").length; } catch (e) {}
             const hackHere = new Set();
             for (const p of ns.ps(host)) {
                 const t = p.args[0];
@@ -47,13 +69,13 @@ export async function main(ns) {
         const cash = ns.getPlayer().money;
         let pserv = 0;
         try { pserv = ns.cloud.getServerNames().length; } catch (e) { pserv = 0; }
-        let totalIncome = 0;
-        for (const t in data) totalIncome += data[t].income;
+        let liveIncome = 0;
+        try { liveIncome = ns.getTotalScriptIncome()[0]; } catch (e) { liveIncome = 0; }
 
         // --- build snapshot lines ---
         const lines = [];
-        lines.push("L" + lvl + "    $" + fmt(cash) + "    farm +$" + fmt(totalIncome) + "/s");
-        lines.push("pool " + totalPrep + " prep + " + totalHack + " hack = " + (totalPrep + totalHack) + "t     rooted " + rooted + "     pserv " + pserv);
+        lines.push("L" + lvl + "    $" + fmt(cash) + "    farm +$" + fmt(liveIncome) + "/s");
+        lines.push("pool " + totalPrep + " prep + " + totalHack + " hack = " + (totalPrep + totalHack) + "t     rooted " + rooted + "     pserv " + pserv + "     contracts " + contracts);
         lines.push("--------------------------------------------------------");
         lines.push(pad("TARGET", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("PREP", 6) + padL("HACK", 6) + padL("$/s", 9));
         const rows = Object.keys(data).sort((a, b) =>
@@ -78,22 +100,16 @@ export async function main(ns) {
 
         const snapshot = lines.join("\n");
 
-        // --- render: copy button on top, then the text ---
+        // --- render: button row, then the text ---
         ns.clearLog();
-        ns.printRaw(React.createElement(
-            "button",
-            {
-                onClick: () => {
-                    try {
-                        globalThis.navigator.clipboard.writeText(snapshot);
-                        ns.toast("HUD copied to clipboard", "success", 2000);
-                    } catch (e) {
-                        ns.toast("copy failed: " + e, "error", 4000);
-                    }
-                },
-                style: { margin: "2px 0 4px 0", padding: "2px 12px", cursor: "pointer" }
-            },
-            "Copy HUD"
+        const btn = (label, onClick) => React.createElement("button",
+            { onClick, style: { padding: "2px 10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px" } }, label);
+        ns.printRaw(React.createElement("div",
+            { style: { display: "flex", gap: "6px", margin: "2px 0 6px 0", flexWrap: "wrap" } },
+            btn("Copy", () => { try { globalThis.navigator.clipboard.writeText(snapshot); } catch (e) {} action = "copied"; }),
+            btn("Pull", () => { action = "pull"; }),
+            btn("Restart Coord", () => { action = "restart"; }),
+            btn("Solve Contracts", () => { action = "puzzles"; })
         ));
         for (const line of lines) ns.print(line);
 
