@@ -12,6 +12,7 @@ export async function main(ns) {
         "farm-status.js", "status.js", "hud.js",
         "puzzles.js", "purchaser.js", "cleanup.js",
         "xp.js", "xpfarm.js",
+        "sh.js", "shareall.js",
         "diagnose-income.js", "earners.js",
         "pull.js"
     ];
