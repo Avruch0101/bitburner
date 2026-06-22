@@ -84,8 +84,13 @@ export async function main(ns) {
         // --- globals ---
         const lvl = ns.getHackingLevel();
         const cash = ns.getPlayer().money;
-        let pserv = 0;
-        try { pserv = ns.cloud.getServerNames().length; } catch (e) { pserv = 0; }
+        let pserv = 0, cloudRam = 0, cloudMax = 0;
+        try {
+            const cnames = ns.cloud.getServerNames();
+            pserv = cnames.length;
+            for (const c of cnames) cloudRam += ns.getServerMaxRam(c);
+            cloudMax = ns.cloud.getRamLimit() * ns.cloud.getServerLimit();   // max possible total cloud RAM
+        } catch (e) { pserv = 0; cloudRam = 0; cloudMax = 0; }
         let liveIncome = 0;
         try { liveIncome = ns.getTotalScriptIncome()[0]; } catch (e) { liveIncome = 0; }
         let sharePow = 1;
@@ -115,7 +120,8 @@ export async function main(ns) {
         lines.push("L" + lvl + "  $" + fmt(cash) + "  farm +$" + fmt(liveIncome) + "/s  share " + shareDisp);
         lines.push("threads: total " + grp(total) + "  deployed " + grp(deployed)
             + " (" + grp(totalPrep) + " prep / " + grp(totalHack) + " hack)  idle " + grp(idle));
-        lines.push("rooted " + rooted + "  pserv " + pserv + "  contracts " + contracts);
+        lines.push("rooted " + rooted + "  pserv " + pserv + "  contracts " + contracts
+            + "  cloud " + fmtRam(cloudRam) + (cloudMax ? " / " + fmtRam(cloudMax) : ""));
         lines.push("");
         lines.push(pad("TARGET", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("PREP", 8) + padL("HACK", 7) + padL("$/s", 9));
         for (const r of rowMeta) {
@@ -151,7 +157,7 @@ export async function main(ns) {
                 prow(lc("Total"),    vc(grp(total) + "t"),    lc("Idle"),      vc(grp(idle) + "t")),
                 prow(lc("Prep"),     vc(grp(totalPrep)),      lc("Hack"),      vc(grp(totalHack))),
                 prow(lc("Rooted"),   vc(String(rooted)),      lc("Pserv"),     vc(String(pserv))),
-                prow(lc("Contracts"),vc(String(contracts)),   lc(""),          vc(""))
+                prow(lc("Contracts"),vc(String(contracts)),   lc("Cloud RAM"), vc(fmtRam(cloudRam) + (cloudMax ? " / " + fmtRam(cloudMax) : "")))
             )
         );
 
@@ -191,5 +197,10 @@ function fmt(n) {
     return n.toFixed(0);
 }
 function grp(n) { return Math.round(n).toLocaleString("en-US"); }
+function fmtRam(gb) {
+    if (gb >= 1e6) return (gb / 1e6).toFixed(2) + " PB";
+    if (gb >= 1e3) return (gb / 1e3).toFixed(1) + " TB";
+    return Math.round(gb) + " GB";
+}
 function pad(s, n) { s = String(s); return s.length >= n ? s.slice(0, n) : s + " ".repeat(n - s.length); }
 function padL(s, n) { s = String(s); return s.length >= n ? s : " ".repeat(n - s.length) + s; }
