@@ -7,7 +7,10 @@ export async function main(ns) {
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
-    const DIG_TARGETS  = 3;      // cold servers to prep IN PARALLEL (each capped), vs dumping all on one focus
+    const DIG_TARGETS  = Number(ns.args[2]) || 6;   // cold servers to prep IN PARALLEL (each capped). This is
+                                 // PREP THROUGHPUT (how fast harvest fills), distinct from numTargets (harvest cap).
+                                 // 3rd CLI arg: `run coordinator.js <numTargets> <levelRatio> <digTargets>`. Raise to
+                                 // fill harvest faster / use more idle pool; each dig is bounded by DIG_PREP_CAP.
     const DIG_PREP_CAP = 6000;   // flat ceiling on prep threads per dig target. A server's prep need is set by
                                  // its OWN economics, not the pool size -- 4% of a 270k pool was still 11k, far
                                  // more than any BN1 server needs at min security. growthAnalyze (no Formulas)
@@ -16,9 +19,6 @@ export async function main(ns) {
                                  // bounded crew preps fully anyway. Raise if big servers prep slowly; lower to cut idle.
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
-    const REFRESH_MS = 600000;   // backstop: re-plan at least this often to pick up pool growth / crew resizing
-                                 // even with nothing else changed -- but NOT level-driven, so a long weaken gets
-                                 // an uninterrupted window instead of being killed every few levels
     const PREP = "prep.js", HACK = "h.js";
     ns.disableLog("ALL");
 
@@ -29,8 +29,7 @@ export async function main(ns) {
     }
 
     const preppedSet = new Set();   // persists across loops (hysteresis state)
-    let lastKey = "";
-    let lastRebalance = 0;          // timestamp of last redeploy, for the REFRESH_MS backstop
+    let lastKey = "";               // last harvest set logged (for change-only logging, not gating)
 
     while (true) {
         try {
@@ -116,59 +115,87 @@ export async function main(ns) {
                 digList = top.filter(t => !preppedSet.has(t)).slice(0, DIG_TARGETS);
             }
 
-            // --- rebalance when harvest MEMBERSHIP or the dig list changes, OR the refresh backstop
-            // fires. LEVEL is deliberately NOT in the key: during a fast-leveling cold start the old
-            // floor(L/10) term fired a teardown every few seconds, and since a rebalance kills in-flight
-            // prep, long weakens on big servers never completed (the omega-net stall). Both lists use
-            // canonical (alphabetical) ordering so re-ranking the same members never triggers a redeploy.
-            const key = [...harvest].sort().join(",") + "|" + [...digList].sort().join(",");
-            const stale = (Date.now() - lastRebalance) > REFRESH_MS;
-            if (key !== lastKey || stale) {
-                lastKey = key;
-                lastRebalance = Date.now();
+            // --- desired plan: per-target thread targets (harvest = hack+prep crew; digs = capped prep) ---
+            const workerRam = Math.max(ns.getScriptRam(PREP, "home"), ns.getScriptRam(HACK, "home")) || 1.75;
+            // full capacity (for HACK_CAP), independent of current deployment so the cap doesn't shrink as we fill
+            let totalCap = 0;
+            for (const h of all.concat("home")) {
+                if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
+                let cap = ns.getServerMaxRam(h);
+                if (h === "home") cap -= HOME_RESERVE;
+                totalCap += Math.max(0, Math.floor(cap / workerRam));
+            }
+            const HACK_CAP = Math.max(1, Math.floor(totalCap * 0.20));   // no single target hogs >20% on hack
+            const crews = {};
+            for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
+            const want = {};        // target -> { hack, prep }  (the steady state we want running)
+            for (const t of harvest) want[t] = { hack: crews[t].hackT, prep: crews[t].prepT };
+            for (const t of digList) {
+                if (want[t]) continue;                              // harvest wins if somehow both
+                const raw = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
+                want[t] = { hack: 0, prep: Math.min(raw, DIG_PREP_CAP) };   // digs: capped prep, no seed-hack
+            }
 
-                const workerRam = Math.max(ns.getScriptRam(PREP,"home"), ns.getScriptRam(HACK,"home"));
-                const pool = [];
-                for (const h of all) {
-                    if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
-                    ns.scriptKill(PREP, h); ns.scriptKill(HACK, h);
-                    ns.scp([PREP, HACK], h, "home");
-                    const free = Math.floor((ns.getServerMaxRam(h) - ns.getServerUsedRam(h)) / workerRam);
-                    if (free > 0) pool.push({ host: h, free });
+            // --- what's actually running now, grouped by target + script ---
+            const byTarget = {};    // target -> { hack: [{pid,threads}], prep: [{pid,threads}] }
+            for (const h of all.concat("home")) {
+                for (const p of ns.ps(h)) {
+                    if (p.filename !== PREP && p.filename !== HACK) continue;
+                    const tgt = p.args[0];
+                    if (!tgt) continue;
+                    if (!byTarget[tgt]) byTarget[tgt] = { hack: [], prep: [] };
+                    (p.filename === HACK ? byTarget[tgt].hack : byTarget[tgt].prep).push({ pid: p.pid, threads: p.threads });
                 }
-                ns.scriptKill(PREP, "home"); ns.scriptKill(HACK, "home");
-                const hf = Math.floor((ns.getServerMaxRam("home") - ns.getServerUsedRam("home") - HOME_RESERVE) / workerRam);
-                if (hf > 0) pool.push({ host: "home", free: hf });
-                pool.sort((a, b) => b.free - a.free);
-                const total = pool.reduce((s, r) => s + r.free, 0);
+            }
 
-                // dynamic crews: size each harvested target from its own economics
-                const HACK_CAP = Math.max(1, Math.floor(total * 0.20));   // no single target hogs >20% of pool on hack
-                const crews = {};
-                for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
-                // pass 1: hack threads first (income drivers), richest target first
-                for (const t of harvest) place(ns, pool, HACK, crews[t].hackT, t);
-                // pass 2: prep to refill the skim
-                for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
-                // pass 3: dig each cold target with a CAPPED crew. The cap is FLAT (DIG_PREP_CAP), not a
-                // pool fraction: a server's prep need is set by its own economics, not pool size, and 4% of a
-                // big pool was still ~11k. prepCost uses growthAnalyze, which counts grow threads at CURRENT
-                // security, so a cold +30-sec target reports a 100k+ "need" -- prep.js weakens to min first
-                // then grows efficiently, so the flat cap preps it fine over a few cycles and stops the dump.
-                // PREP only, never seed-hack (hacking an unsettled server traps it at high-sec / $0).
-                for (const t of digList) {
-                    const raw = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
-                    place(ns, pool, PREP, Math.min(raw, DIG_PREP_CAP), t);
-                }
-                // pass 4: soak remaining surplus as extra prep on the earners (richest-first, ~2x base),
-                // then leave the rest idle (persistent idle => raise numTargets / ratio / DIG_TARGETS)
-                for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
+            // --- RECONCILE: kill only the excess, start only the deficit; leave correct workers running.
+            // This replaces the old kill-everything-and-redeploy rebalance, which tore down every hack crew
+            // each loop and (with many parallel digs finishing at staggered times) pinned income at $0. Now a
+            // harvest server's crew is touched ONLY when its own plan changes; the dig-list reshuffle that used
+            // to trigger a full teardown now adjusts just the one or two servers that actually changed. ---
+            const remain = {};      // target -> { hack, prep } surviving the kill pass
+            const targets = new Set([...Object.keys(byTarget), ...Object.keys(want)]);
+            for (const t of targets) {
+                const w = want[t] || { hack: 0, prep: 0 };
+                const cur = byTarget[t] || { hack: [], prep: [] };
+                remain[t] = { hack: killExcess(ns, cur.hack, w.hack), prep: killExcess(ns, cur.prep, w.prep) };
+            }
+            await ns.sleep(50);     // let killed RAM free before recomputing the pool
+
+            // build the free-RAM pool (idle capacity now); scp workers to any host missing them
+            const pool = [];
+            for (const h of all.concat("home")) {
+                if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
+                if (!ns.fileExists(PREP, h) || !ns.fileExists(HACK, h)) ns.scp([PREP, HACK], h, "home");
+                let avail = ns.getServerMaxRam(h) - ns.getServerUsedRam(h);
+                if (h === "home") avail -= HOME_RESERVE;
+                const free = Math.floor(avail / workerRam);
+                if (free > 0) pool.push({ host: h, free });
+            }
+            pool.sort((a, b) => b.free - a.free);
+
+            // start deficits: hack first (income), then prep (harvest maintenance + digs). A deadband skips
+            // sub-10% gaps so small crew-size drift between loops doesn't cause constant kill/restart churn.
+            const worth = (w, have) => (w - have) > Math.max(3, Math.ceil(w * 0.10));
+            for (const t of harvest) {
+                const r = remain[t] || { hack: 0, prep: 0 };
+                if (worth(want[t].hack, r.hack)) place(ns, pool, HACK, want[t].hack - r.hack, t);
+            }
+            for (const t of Object.keys(want)) {
+                const r = remain[t] || { hack: 0, prep: 0 };
+                if (worth(want[t].prep, r.prep)) place(ns, pool, PREP, want[t].prep - r.prep, t);
+            }
+
+            // log only when the HARVEST set changes (meaningful events); the dig-list reshuffle no longer
+            // tears anything down, so it isn't worth a line every loop
+            const hkey = [...harvest].sort().join(",");
+            if (hkey !== lastKey) {
+                lastKey = hkey;
                 const idle = pool.reduce((s, r) => s + r.free, 0);
-
-                const crewStr = harvest.map(t => t + "(h" + crews[t].hackT + "/p" + crews[t].prepT + ")").join(" ");
+                const crewStr = harvest.map(t => t + "(h" + want[t].hack + "/p" + want[t].prep + ")").join(" ");
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
-                    + "  dig " + (digList.join(",") || "(none)")
-                    + "  pool " + total + "t" + (idle > 0 ? "  idle " + idle + "t (raise targets/ratio/DIG)" : ""));
+                    + "  dig[" + digList.length + "] " + (digList.join(",") || "(none)")
+                    + "  cap " + totalCap + "t  idle " + idle + "t");
             }
         } catch (e) {
             ns.print("loop error: " + e);
@@ -186,6 +213,23 @@ function place(ns, pool, script, threads, target) {
         const pid = ns.exec(script, r.host, n, target);
         if (pid !== 0) { r.free -= n; remaining -= n; }
     }
+}
+
+// Kill whole worker processes for one (target, script) until the running thread count is at/under
+// `desired`. Smallest-first, so we overshoot as little as possible. A 15% overage is left alone
+// (deadband) so tiny crew-size drift between loops doesn't cause constant kill/restart churn.
+// Returns the thread count still running afterward.
+function killExcess(ns, procs, desired) {
+    let cur = 0;
+    for (const p of procs) cur += p.threads;
+    if (cur <= Math.ceil(desired * 1.15)) return cur;     // within tolerance (or desired 0 & cur 0)
+    procs.sort((a, b) => a.threads - b.threads);
+    for (const p of procs) {
+        if (cur <= desired) break;
+        ns.kill(p.pid);
+        cur -= p.threads;
+    }
+    return cur;
 }
 
 // Size a harvest crew for one target from its own hack/grow economics.
