@@ -2,9 +2,11 @@
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
-    ns.ui.resizeTail(680, 500);
+    ns.ui.resizeTail(700, 520);
     const React = globalThis.React;
-    let action = null;  // set by buttons, performed by the loop (avoids ns calls inside click handlers)
+    const h = React.createElement;
+    const HOME_RESERVE = 24;   // match coordinator: GB kept free on home
+    let action = null;         // set by buttons, performed by the loop (no ns calls inside click handlers)
 
     while (true) {
         // --- perform any pending button action in loop context ---
@@ -64,6 +66,21 @@ export async function main(ns) {
             for (const t of hackHere) data[t].income += ns.getScriptIncome("h.js", host, t);
         }
 
+        // --- pool capacity (idle threads = free RAM now; total = idle + deployed) ---
+        const workerRam = Math.max(ns.getScriptRam("prep.js", "home"), ns.getScriptRam("h.js", "home")) || 1.75;
+        let idle = 0;
+        for (const host of all) {
+            if (!ns.hasRootAccess(host)) continue;
+            const maxR = ns.getServerMaxRam(host);
+            if (maxR <= 0) continue;
+            let avail = maxR - ns.getServerUsedRam(host);
+            if (host === "home") avail -= HOME_RESERVE;
+            const free = Math.floor(avail / workerRam);
+            if (free > 0) idle += free;
+        }
+        const deployed = totalPrep + totalHack;
+        const total = idle + deployed;
+
         // --- globals ---
         const lvl = ns.getHackingLevel();
         const cash = ns.getPlayer().money;
@@ -73,48 +90,94 @@ export async function main(ns) {
         try { liveIncome = ns.getTotalScriptIncome()[0]; } catch (e) { liveIncome = 0; }
         let sharePow = 1;
         try { sharePow = ns.getSharePower(); } catch (e) { sharePow = 1; }
-        const shareStr = sharePow > 1.001 ? ("share x" + sharePow.toFixed(3)) : "share off";
+        const shareDisp = sharePow > 1.001 ? ("x" + sharePow.toFixed(3)) : "off";
 
-        // --- build snapshot lines ---
-        const lines = [];
-        lines.push("L" + lvl + "    $" + fmt(cash) + "    farm +$" + fmt(liveIncome) + "/s");
-        lines.push("pool " + totalPrep + " prep + " + totalHack + " hack = " + (totalPrep + totalHack) + "t     rooted " + rooted + "     pserv " + pserv + "     contracts " + contracts + "     " + shareStr);
-        lines.push("--------------------------------------------------------");
-        lines.push(pad("TARGET", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("PREP", 6) + padL("HACK", 6) + padL("$/s", 9));
+        // --- theme (for sticky bar background so it covers scrolled content) ---
+        let theme = {};
+        try { theme = ns.ui.getTheme(); } catch (e) {}
+        const bg = theme.backgroundprimary || "#1a1a1a";
+        const muted = theme.secondary || "#888";
+
+        // --- sorted target rows ---
         const rows = Object.keys(data).sort((a, b) =>
             (data[b].income - data[a].income) ||
             (data[b].hack - data[a].hack) ||
             (data[b].prep - data[a].prep));
-        for (const t of rows) {
+        const rowMeta = rows.map(t => {
             const max = ns.getServerMaxMoney(t);
             const mon = max > 0 ? (ns.getServerMoneyAvailable(t) / max * 100) : 0;
             const sec = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
-            const d = data[t];
-            lines.push(
-                pad(t, 20) +
-                padL(mon.toFixed(1), 6) +
-                padL("+" + sec.toFixed(1), 7) +
-                padL(String(d.prep), 6) +
-                padL(String(d.hack), 6) +
-                padL(fmt(d.income), 9)
-            );
-        }
-        if (rows.length === 0) lines.push("(no farm workers deployed yet)");
+            return { t, mon, sec, prep: data[t].prep, hack: data[t].hack, income: data[t].income };
+        });
 
+        // --- text snapshot for the Copy button ---
+        const lines = [];
+        lines.push("L" + lvl + "  $" + fmt(cash) + "  farm +$" + fmt(liveIncome) + "/s  share " + shareDisp);
+        lines.push("threads: total " + grp(total) + "  deployed " + grp(deployed)
+            + " (" + grp(totalPrep) + " prep / " + grp(totalHack) + " hack)  idle " + grp(idle));
+        lines.push("rooted " + rooted + "  pserv " + pserv + "  contracts " + contracts);
+        lines.push("");
+        lines.push(pad("TARGET", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("PREP", 8) + padL("HACK", 7) + padL("$/s", 9));
+        for (const r of rowMeta) {
+            lines.push(pad(r.t, 20) + padL(r.mon.toFixed(1), 6) + padL("+" + r.sec.toFixed(1), 7)
+                + padL(grp(r.prep), 8) + padL(grp(r.hack), 7) + padL(fmt(r.income), 9));
+        }
         const snapshot = lines.join("\n");
 
-        // --- render: button row, then the text ---
-        ns.clearLog();
-        const btn = (label, onClick) => React.createElement("button",
+        // --- REGION: buttons (pinned to top) ---
+        const btn = (label, onClick) => h("button",
             { onClick, style: { padding: "2px 10px", cursor: "pointer", fontFamily: "inherit", fontSize: "12px" } }, label);
-        ns.printRaw(React.createElement("div",
-            { style: { display: "flex", gap: "6px", margin: "2px 0 6px 0", flexWrap: "wrap" } },
+        const buttonsRegion = h("div", {
+            style: {
+                position: "sticky", top: 0, zIndex: 10, background: bg,
+                display: "flex", gap: "6px", padding: "4px 0 6px 0", flexWrap: "wrap",
+                borderBottom: "1px solid " + muted, marginBottom: "6px"
+            }
+        },
             btn("Copy", () => { try { globalThis.navigator.clipboard.writeText(snapshot); } catch (e) {} action = "copied"; }),
             btn("Pull", () => { action = "pull"; }),
             btn("Restart Coord", () => { action = "restart"; }),
             btn("Solve Contracts", () => { action = "puzzles"; })
-        ));
-        for (const line of lines) ns.print(line);
+        );
+
+        // --- REGION: pool table (summary values incl. total + idle threads) ---
+        const lc = (s) => h("td", { style: { color: muted, padding: "1px 6px 1px 0", whiteSpace: "nowrap" } }, s);
+        const vc = (s) => h("td", { style: { padding: "1px 18px 1px 0", whiteSpace: "nowrap", fontWeight: 600 } }, s);
+        const prow = (...cells) => h("tr", null, ...cells);
+        const poolTable = h("table", { style: { borderCollapse: "collapse", fontSize: "12px", marginBottom: "8px" } },
+            h("tbody", null,
+                prow(lc("Level"),    vc(String(lvl)),         lc("Cash"),      vc("$" + fmt(cash))),
+                prow(lc("Farm/s"),   vc("+$" + fmt(liveIncome)), lc("Share"),   vc(shareDisp)),
+                prow(lc("Total"),    vc(grp(total) + "t"),    lc("Idle"),      vc(grp(idle) + "t")),
+                prow(lc("Prep"),     vc(grp(totalPrep)),      lc("Hack"),      vc(grp(totalHack))),
+                prow(lc("Rooted"),   vc(String(rooted)),      lc("Pserv"),     vc(String(pserv))),
+                prow(lc("Contracts"),vc(String(contracts)),   lc(""),          vc(""))
+            )
+        );
+
+        // --- REGION: farm table (per-target) ---
+        const th = (s, align) => h("th", { style: { textAlign: align, padding: "2px 12px 4px 0", borderBottom: "1px solid " + muted, whiteSpace: "nowrap" } }, s);
+        const td = (s, align) => h("td", { style: { textAlign: align, padding: "1px 12px 1px 0", whiteSpace: "nowrap" } }, s);
+        const farmBody = rowMeta.length
+            ? rowMeta.map(r => h("tr", { key: r.t },
+                td(r.t, "left"),
+                td(r.mon.toFixed(1), "right"),
+                td("+" + r.sec.toFixed(1), "right"),
+                td(grp(r.prep), "right"),
+                td(grp(r.hack), "right"),
+                td(fmt(r.income), "right")))
+            : [h("tr", { key: "_none" }, h("td", { colSpan: 6, style: { color: muted, padding: "4px 0" } }, "(no farm workers deployed yet)"))];
+        const farmTable = h("table", { style: { borderCollapse: "collapse", fontSize: "12px" } },
+            h("thead", null, h("tr", null,
+                th("TARGET", "left"), th("MON%", "right"), th("SEC", "right"),
+                th("PREP", "right"), th("HACK", "right"), th("$/s", "right"))),
+            h("tbody", null, ...farmBody)
+        );
+
+        // --- render the whole HUD as one tree ---
+        ns.clearLog();
+        ns.printRaw(h("div", { style: { fontFamily: "inherit", fontSize: "12px" } },
+            buttonsRegion, poolTable, farmTable));
 
         await ns.sleep(2000);
     }
@@ -127,5 +190,6 @@ function fmt(n) {
     if (a >= 1e3) return (n / 1e3).toFixed(1) + "k";
     return n.toFixed(0);
 }
+function grp(n) { return Math.round(n).toLocaleString("en-US"); }
 function pad(s, n) { s = String(s); return s.length >= n ? s.slice(0, n) : s + " ".repeat(n - s.length); }
 function padL(s, n) { s = String(s); return s.length >= n ? s : " ".repeat(n - s.length) + s; }
