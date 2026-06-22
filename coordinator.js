@@ -45,10 +45,16 @@ export async function main(ns) {
             // --- pick candidates (level-filtered, richest first) ---
             const L = ns.getHackingLevel();
             const maxReq = L * levelRatio;
-            const eligible = all
-                .filter(h => ns.hasRootAccess(h) && ns.getServerMaxMoney(h) > 0
-                          && ns.getServerRequiredHackingLevel(h) <= maxReq)
-                .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
+            // servers I can currently hack at all: rooted, has money, reqLevel <= my level
+            const rootedMoney = all.filter(h => ns.hasRootAccess(h) && ns.getServerMaxMoney(h) > 0
+                                              && ns.getServerRequiredHackingLevel(h) <= L);
+            // normal selection uses the ratio filter (skip near-level targets with poor odds);
+            // but if that strands us with ZERO targets -- the cold-start deadlock, e.g. n00dles
+            // needs L1 while ratio*L < 1 at level 1 -- fall back to every hackable server so the
+            // coordinator can never sit idle with no targets and no way to level out of it.
+            let eligible = rootedMoney.filter(h => ns.getServerRequiredHackingLevel(h) <= maxReq);
+            if (eligible.length === 0) eligible = rootedMoney;
+            eligible.sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
             const top = eligible.slice(0, numTargets);
 
             // --- classify with hysteresis over top + already-prepped (keeps sticky earners fresh) ---
