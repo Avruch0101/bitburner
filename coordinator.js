@@ -118,11 +118,12 @@ export async function main(ns) {
                 for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
                 // pass 3: surplus -> focus prep (dig the new target), else cascade extra prep onto richest earners
                 if (focus) {
+                    // Fully PREP the focus to max money AND min security before any hack threads
+                    // touch it. Seeding hack onto an unsettled target was trapping the cold start
+                    // at 100%-money / high-security / $0 income (h.js won't hack until sec is at min).
+                    // Once prepped, next loop the focus joins preppedSet and gets a real hack crew.
                     const left = pool.reduce((s, r) => s + r.free, 0);
-                    const fc = crewFor(ns, focus, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
-                    const seed = Math.min(fc.hackT, Math.floor(left * 0.1));
-                    place(ns, pool, HACK, seed, focus);
-                    place(ns, pool, PREP, left - seed, focus);
+                    place(ns, pool, PREP, left, focus);
                 } else {
                     // richest-first: give each earner up to 2x its base prep, then stop
                     for (const t of harvest) place(ns, pool, PREP, crews[t].prepT * 2, t);
