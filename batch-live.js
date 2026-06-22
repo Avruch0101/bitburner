@@ -1,8 +1,9 @@
 /** @param {NS} ns
- * Live (ns) layer for the batcher: reads target params via the Formulas.exe path when
- * present and a base-function fallback when not, and provides pool dispatch.
- * This is the small runtime-only surface that CANNOT be unit-tested in Node -- kept thin.
+ * Live (ns) layer for the batcher: target params (Formulas path or base fallback),
+ * pool dispatch, and a shared prep loop. Runtime-only -- cannot be Node-tested.
  */
+import { weakenThreadsToMin, growMultiplierToMax, GROW_SEC_PER_THREAD } from "batch-math.js";
+
 export const HOME_RESERVE = 24; // GB kept free on home
 
 export function getParams(ns, target) {
@@ -58,7 +59,6 @@ export function pool(ns) {
   return hosts;
 }
 
-// scp `script` to each host and exec to place up to `threads` total across the pool.
 export function dispatch(ns, script, threads, ...args) {
   if (threads <= 0) return 0;
   const ram = ns.getScriptRam(script, "home");
@@ -73,4 +73,27 @@ export function dispatch(ns, script, threads, ...args) {
     if (ns.exec(script, host, n, ...args) !== 0) placed += n;
   }
   return placed;
+}
+
+// Bring `target` to max money / min security, then return true. log(msg) for progress.
+export async function prepTarget(ns, target, log = () => {}) {
+  for (let pass = 1; pass < 100000; pass++) {
+    const p = getParams(ns, target);
+    if (p.prepped) { log("PREPPED " + target); return true; }
+    if (p.curSec > p.minSec + 0.01) {
+      const wt = weakenThreadsToMin(p.curSec, p.minSec, p.weakenPerThread);
+      const got = dispatch(ns, "bweaken.js", wt, target, 0);
+      log(`prep ${pass}: weaken ${got}/${wt}  sec ${p.curSec.toFixed(2)}->${p.minSec.toFixed(2)}`);
+      await ns.sleep(p.weakenTime + 400);
+    } else {
+      const mult = growMultiplierToMax(p.curMoney, p.maxMoney);
+      const gt = growThreadsForMultiplier(ns, target, mult, p);
+      const gGot = dispatch(ns, "bgrow.js", gt, target, 0);
+      const wt = Math.ceil(gGot * GROW_SEC_PER_THREAD / p.weakenPerThread);
+      const wGot = dispatch(ns, "bweaken.js", wt, target, 0);
+      log(`prep ${pass}: grow ${gGot}/${gt} (${(100*p.curMoney/p.maxMoney).toFixed(1)}%) +weaken ${wGot}`);
+      await ns.sleep(p.weakenTime + 400);
+    }
+  }
+  return false;
 }

@@ -4,20 +4,20 @@ export async function main(ns) {
     const USER = "Avruch0101";
     const REPO = "bitburner";
     const BRANCH = "main";
-    // ---------------------------------------------------
-    // pull.js is fetched LAST on purpose: a running script can't reload its own
-    // code, so updating it is the one case that always needs a manual reload.
+    // pull.js is fetched LAST: a running script can't reload its own code.
     const files = [
         "coordinator.js", "prep.js", "h.js",
         "farm-status.js", "status.js", "hud.js",
         "puzzles.js", "purchaser.js", "cleanup.js",
-        "xp.js", "xpfarm.js",
-        "sh.js", "shareall.js",
+        "xp.js", "xpfarm.js", "sh.js", "shareall.js",
         "diagnose-income.js", "earners.js",
+        // --- HWGW batcher ---
+        "batch-math.js", "batch-live.js",
+        "bhack.js", "bgrow.js", "bweaken.js",
+        "bprep.js", "bdiag.js", "bbatch.js",
         "pull.js"
     ];
     const base = "https://raw.githubusercontent.com/" + USER + "/" + REPO + "/" + BRANCH + "/";
-
     const running = new Set();
     for (const p of ns.ps("home")) running.add(p.filename);
 
@@ -34,12 +34,8 @@ export async function main(ns) {
             if (f === "pull.js" || running.has(f)) needReload.push(f);
         }
     }
-
     ns.tprint("pull: " + ok + " ok, " + miss + " missing, " + changed.length + " changed"
         + (changed.length ? "  [" + changed.join(", ") + "]" : ""));
-    if (needReload.length) {
-        ns.tprint("RELOAD the game to apply (running or self-update): " + needReload.join(", "));
-    } else {
-        ns.tprint("no reload needed - changed files will compile fresh on next run.");
-    }
+    if (needReload.length) ns.tprint("RELOAD the game to apply (running or self-update): " + needReload.join(", "));
+    else ns.tprint("no reload needed - changed files compile fresh on next run.");
 }
