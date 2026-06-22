@@ -7,8 +7,12 @@ export async function main(ns) {
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
+    const DIG_TARGETS  = 3;      // cold servers to prep IN PARALLEL (each capped), vs dumping all on one focus
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
+    const REFRESH_MS = 600000;   // backstop: re-plan at least this often to pick up pool growth / crew resizing
+                                 // even with nothing else changed -- but NOT level-driven, so a long weaken gets
+                                 // an uninterrupted window instead of being killed every few levels
     const PREP = "prep.js", HACK = "h.js";
     ns.disableLog("ALL");
 
@@ -20,6 +24,7 @@ export async function main(ns) {
 
     const preppedSet = new Set();   // persists across loops (hysteresis state)
     let lastKey = "";
+    let lastRebalance = 0;          // timestamp of last redeploy, for the REFRESH_MS backstop
 
     while (true) {
         try {
@@ -91,28 +96,30 @@ export async function main(ns) {
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
                              .slice(0, numTargets + STICKY_EXTRA);
-            // focus selection:
-            //  - with no earners yet, bootstrap the FASTEST-to-prep eligible server so income
-            //    starts in seconds instead of waiting on the richest cold target ($0 gap cure)
-            //  - once something is earning, dig the richest unprepped target with surplus
-            let focus;
+            // dig list: the cold servers we actively prep THIS cycle, in parallel, each capped to its
+            // own need (pass 3 below). Capping + parallelism replaces "pour the whole pool into one
+            // focus" -- at a 100k+ thread pool that wasted nearly all of it on a server needing a few hundred.
+            //  - no earners yet: bootstrap the FASTEST-to-prep servers first (income in seconds)
+            //  - once earning: dig the highest-POTENTIAL unprepped top-N targets (big servers now included)
+            let digList;
             if (harvest.length === 0) {
-                const cold = eligible.filter(t => !preppedSet.has(t));
-                focus = cold.length
-                    ? cold.reduce((a, b) => prepCost(ns, b) < prepCost(ns, a) ? b : a)
-                    : null;
+                digList = eligible.filter(t => !preppedSet.has(t))
+                    .sort((a, b) => prepCost(ns, a) - prepCost(ns, b))
+                    .slice(0, DIG_TARGETS);
             } else {
-                // top is now efficiency-ranked, so this digs the best $/RAM-sec unprepped target
-                // rather than merely the richest. Quantized scores keep this choice stable loop-to-loop.
-                focus = top.find(t => !preppedSet.has(t)) || null;
+                digList = top.filter(t => !preppedSet.has(t)).slice(0, DIG_TARGETS);
             }
 
-            // --- only rebalance when the harvest MEMBERSHIP, focus, or level-band changes ---
-            // key is built from a canonical (alphabetical) member ordering, NOT the efficiency sort
-            // order, so re-ranking the same set of earners never triggers a teardown/redeploy.
-            const key = [...harvest].sort().join(",") + "|" + (focus || "") + "|L" + Math.floor(L / 10);
-            if (key !== lastKey) {
+            // --- rebalance when harvest MEMBERSHIP or the dig list changes, OR the refresh backstop
+            // fires. LEVEL is deliberately NOT in the key: during a fast-leveling cold start the old
+            // floor(L/10) term fired a teardown every few seconds, and since a rebalance kills in-flight
+            // prep, long weakens on big servers never completed (the omega-net stall). Both lists use
+            // canonical (alphabetical) ordering so re-ranking the same members never triggers a redeploy.
+            const key = [...harvest].sort().join(",") + "|" + [...digList].sort().join(",");
+            const stale = (Date.now() - lastRebalance) > REFRESH_MS;
+            if (key !== lastKey || stale) {
                 lastKey = key;
+                lastRebalance = Date.now();
 
                 const workerRam = Math.max(ns.getScriptRam(PREP,"home"), ns.getScriptRam(HACK,"home"));
                 const pool = [];
@@ -137,24 +144,23 @@ export async function main(ns) {
                 for (const t of harvest) place(ns, pool, HACK, crews[t].hackT, t);
                 // pass 2: prep to refill the skim
                 for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
-                // pass 3: surplus -> focus prep (dig the new target), else cascade extra prep onto richest earners
-                if (focus) {
-                    // Fully PREP the focus to max money AND min security before any hack threads
-                    // touch it. Seeding hack onto an unsettled target was trapping the cold start
-                    // at 100%-money / high-security / $0 income (h.js won't hack until sec is at min).
-                    // Once prepped, next loop the focus joins preppedSet and gets a real hack crew.
-                    const left = pool.reduce((s, r) => s + r.free, 0);
-                    place(ns, pool, PREP, left, focus);
-                } else {
-                    // richest-first: give each earner up to 2x its base prep, then stop
-                    for (const t of harvest) place(ns, pool, PREP, crews[t].prepT * 2, t);
+                // pass 3: dig each cold target with a CAPPED crew -- enough to weaken+grow it in
+                // ~one cycle (prepCost x margin), no more. PREP only, never seed-hack: hacking an
+                // unsettled server traps it at high-sec / $0. Parallel + capped brings several big
+                // servers online at once instead of pouring the whole pool into one.
+                for (const t of digList) {
+                    const need = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
+                    place(ns, pool, PREP, need, t);
                 }
+                // pass 4: soak remaining surplus as extra prep on the earners (richest-first, ~2x base),
+                // then leave the rest idle (persistent idle => raise numTargets / ratio / DIG_TARGETS)
+                for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
                 const idle = pool.reduce((s, r) => s + r.free, 0);
 
                 const crewStr = harvest.map(t => t + "(h" + crews[t].hackT + "/p" + crews[t].prepT + ")").join(" ");
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
-                    + "  dig " + (focus || "(none)")
-                    + "  pool " + total + "t" + (idle > 0 ? "  idle " + idle + "t (raise targets/ratio)" : ""));
+                    + "  dig " + (digList.join(",") || "(none)")
+                    + "  pool " + total + "t" + (idle > 0 ? "  idle " + idle + "t (raise targets/ratio/DIG)" : ""));
             }
         } catch (e) {
             ns.print("loop error: " + e);
@@ -202,21 +208,29 @@ function prepCost(ns, t) {
 }
 
 // --- yield-efficiency score (relative target ranking) ---------------------------------------
-// effScore is PURE (Node-testable): expected income rate per hack thread = $ * frac * prob / ms.
-// Quantized to 3 significant figures so sub-0.1% drift in the live reads can't reorder targets
-// and thrash focus/key selection. Higher = better target. Returns 0 on any non-positive input.
-function effScore(maxMoney, hackPct, hackChance, hackTimeMs) {
-    if (!(maxMoney > 0) || !(hackPct > 0) || !(hackChance > 0) || !(hackTimeMs > 0)) return 0;
-    return quantize((maxMoney * hackPct * hackChance) / hackTimeMs);
+// effScore is PURE (Node-testable): the expected income rate per hack thread a server would have
+// once PREPPED (at min security / max money), computed analytically from static values + level.
+// Scoring potential -- not current state -- is deliberate: a big server sitting COLD (high sec,
+// low money) reads as terrible on the live hack functions, which made focus avoid the very
+// servers it should dig. Potential scoring ranks them by what they're worth once prepped.
+// Quantized to 3 sig figs so small per-loop drift can't reorder targets and thrash focus/key.
+function effScore(maxMoney, reqLevel, minSec, level) {
+    if (!(maxMoney > 0) || !(level > 0)) return 0;
+    const diffMult = Math.max(0, (100 - minSec) / 100);                 // 0 at sec 100
+    const pct    = Math.max(0, (level - (reqLevel - 1)) / level) * diffMult / 240;   // frac/thread at min sec
+    const chance = Math.max(0, Math.min(1, (1.75 * level - reqLevel) / (1.75 * level))) * diffMult;
+    const timeProxy = (2.5 * reqLevel * minSec + 500) / (level + 50);   // ~hackTime at min sec (×5 const drops out)
+    if (!(pct > 0) || !(chance > 0) || !(timeProxy > 0)) return 0;
+    return quantize((maxMoney * pct * chance) / timeProxy);
 }
 function quantize(x) {
     if (!(x > 0) || !isFinite(x)) return 0;
     return Number(x.toPrecision(3));
 }
-// live wrapper: base-API reads only (NO Formulas.exe, which is lost on every install). For a
-// prepped server these are at min-sec / max-money (accurate); for a cold server they're a
-// current-state approximation -- fine for relative ranking, but flagged: cold scores understate
-// a target until it's prepped, so focus can favor a partly-prepped server over a colder one.
+// live wrapper: STATIC reads only (maxMoney, reqLevel, minSec) + current level. No current-security
+// reads, no Formulas.exe (lost every install). Same score whether the server is cold or prepped,
+// so focus picks the highest-potential cold target to dig instead of fleeing it.
 function scoreServer(ns, t) {
-    return effScore(ns.getServerMaxMoney(t), ns.hackAnalyze(t), ns.hackAnalyzeChance(t), ns.getHackTime(t));
+    return effScore(ns.getServerMaxMoney(t), ns.getServerRequiredHackingLevel(t),
+                    ns.getServerMinSecurityLevel(t), ns.getHackingLevel());
 }
