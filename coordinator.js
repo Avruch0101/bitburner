@@ -8,6 +8,10 @@ export async function main(ns) {
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
     const DIG_TARGETS  = 3;      // cold servers to prep IN PARALLEL (each capped), vs dumping all on one focus
+    const DIG_CAP_FRAC = 0.04;   // hard ceiling per dig = this fraction of the pool. growthAnalyze (no Formulas)
+                                 // counts grow threads at the server's CURRENT security, so on a cold high-sec
+                                 // target prepCost balloons; this stops one dig from eating the pool. prep.js
+                                 // weakens to min first then grows efficiently, so it never needs the inflated count.
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const REFRESH_MS = 600000;   // backstop: re-plan at least this often to pick up pool growth / crew resizing
@@ -144,13 +148,15 @@ export async function main(ns) {
                 for (const t of harvest) place(ns, pool, HACK, crews[t].hackT, t);
                 // pass 2: prep to refill the skim
                 for (const t of harvest) place(ns, pool, PREP, crews[t].prepT, t);
-                // pass 3: dig each cold target with a CAPPED crew -- enough to weaken+grow it in
-                // ~one cycle (prepCost x margin), no more. PREP only, never seed-hack: hacking an
-                // unsettled server traps it at high-sec / $0. Parallel + capped brings several big
-                // servers online at once instead of pouring the whole pool into one.
+                // pass 3: dig each cold target with a CAPPED crew. The cap is a fraction of the pool,
+                // NOT prepCost x margin alone: prepCost uses growthAnalyze, which counts grow threads at
+                // CURRENT security, so a cold +30-sec target reports a 100k+ "need". prep.js weakens to
+                // min first, then grows efficiently, so it never needs that -- digCap stops the dump.
+                // PREP only, never seed-hack (hacking an unsettled server traps it at high-sec / $0).
+                const digCap = Math.max(256, Math.floor(total * DIG_CAP_FRAC));
                 for (const t of digList) {
-                    const need = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
-                    place(ns, pool, PREP, need, t);
+                    const raw = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
+                    place(ns, pool, PREP, Math.min(raw, digCap), t);
                 }
                 // pass 4: soak remaining surplus as extra prep on the earners (richest-first, ~2x base),
                 // then leave the rest idle (persistent idle => raise numTargets / ratio / DIG_TARGETS)
