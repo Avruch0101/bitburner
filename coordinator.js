@@ -9,7 +9,7 @@ export async function main(ns) {
                                  // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
     const BATCH_FLOOR = 10e9;    // a server must be at least this fat ($10b maxMoney) to deserve a batcher slot;
                                  // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
-    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 16;   // sparse/safe batch density (tune in-file)
+    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 6;   // sparse/safe batch density (tune in-file)
                                  // HOME_RESERVE is computed per-loop below from the live batcher count (auto-sized).
     const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
