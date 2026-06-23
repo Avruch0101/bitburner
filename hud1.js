@@ -16,6 +16,7 @@ export async function main(ns) {
     const HOME_RESERVE = 24;   // match coordinator: GB kept free on home
     let action = null;
     let pendingDump = null;    // "harvest" | "batch" -- printed to terminal next loop
+    let statusText = "";       // updated each loop; click handler reads the latest snapshot
 
     while (true) {
         // --- pending button actions ---
@@ -229,6 +230,81 @@ export async function main(ns) {
             );
         });
 
+        // --- build status snapshot text for the [snapshot] button (held in scope for click handler) ---
+        const ts = new Date().toISOString().slice(0, 19).replace("T", " ");
+        const cash = ns.getPlayer().money;
+        const lvl = ns.getHackingLevel();
+        const homePct = homeMax > 0 ? Math.round(homeUsed / homeMax * 100) : 0;
+        const cloudPct = cloudMax > 0 ? Math.round(cloudUsed / cloudMax * 100) : 0;
+        const netPct = netMax > 0 ? Math.round(netUsed / netMax * 100) : 0;
+        const lines = [];
+        lines.push("=== bb-status @ " + ts + " ===");
+        lines.push("level " + lvl + "  cash $" + fmt(cash) + "  income $" + fmt(liveIncome) + "/s  share " + shareDisp + "  rooted " + rooted + "  contracts " + contracts);
+        lines.push("");
+        lines.push("RAM");
+        lines.push("  home    " + fmtGB(homeUsed) + " / " + fmtGB(homeMax) + "   " + homePct + "%");
+        lines.push("  cloud   " + fmtGB(cloudUsed) + " / " + fmtGB(cloudMax) + "   " + cloudPct + "% (" + cloudCount + " srv)");
+        lines.push("  network " + fmtGB(netUsed) + " / " + fmtGB(netMax) + "   " + netPct + "% (" + netCount + " srv)");
+        lines.push("");
+        lines.push("THREADS");
+        lines.push("  deployed " + deployed + "  batch " + totalBatch + "  idle " + idle + "  total " + total);
+        lines.push("  harvest income $" + fmt(harvestIncome) + "/s   batch income $" + fmt(batchIncome) + "/s");
+        lines.push("");
+        lines.push("HARVEST (" + harvestServers + " server" + (harvestServers === 1 ? "" : "s") + ")");
+        if (harvestServers === 0) {
+            lines.push("  (none)");
+        } else {
+            lines.push("  server                   MON%   SEC    PREP    HACK      $/s");
+            const sorted = Object.entries(data).filter(([t]) => !batchTargets.has(t)).sort((a, b) => b[1].income - a[1].income);
+            for (const [t, d] of sorted) {
+                const max = ns.getServerMaxMoney(t) || 1;
+                const cur = ns.getServerMoneyAvailable(t);
+                const sec = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
+                lines.push(
+                    "  " + t.padEnd(22) +
+                    (cur / max * 100).toFixed(1).padStart(5) + "  " +
+                    ("+" + sec.toFixed(1)).padStart(5) + "  " +
+                    String(d.prep).padStart(6) + "  " +
+                    String(d.hack).padStart(6) + "  " +
+                    ("$" + fmt(d.income)).padStart(9)
+                );
+            }
+        }
+        lines.push("");
+        const batchCount = Object.keys(batchData).length;
+        lines.push("BATCH (" + batchCount + " server" + (batchCount === 1 ? "" : "s") + ")");
+        if (batchCount === 0) {
+            lines.push("  (none)");
+        } else {
+            lines.push("  server                   MON%   SEC   threads");
+            const sorted = Object.entries(batchData).sort((a, b) => b[1].threads - a[1].threads);
+            for (const [t, d] of sorted) {
+                const max = ns.getServerMaxMoney(t) || 1;
+                const cur = ns.getServerMoneyAvailable(t);
+                const sec = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
+                lines.push(
+                    "  " + t.padEnd(22) +
+                    (cur / max * 100).toFixed(1).padStart(5) + "  " +
+                    ("+" + sec.toFixed(1)).padStart(5) + "  " +
+                    String(d.threads).padStart(7)
+                );
+            }
+        }
+        lines.push("");
+        lines.push("CONTROLLERS");
+        if (controllers.length === 0) {
+            lines.push("  (none)");
+        } else {
+            for (const c of controllers) {
+                let up = "?";
+                try { const info = ns.getRunningScript(c.pid); if (info) up = fmtTime(info.onlineRunningTime); } catch (e) {}
+                lines.push("  " + (c.kind === "coord" ? "coord " + c.label : "batch " + c.label).padEnd(28) + up);
+            }
+        }
+        lines.push("");
+        lines.push("(faction/aug state not included -- launch hud2 for that)");
+        statusText = lines.join("\n");
+
         // --- render ---
         ns.clearLog();
         ns.printRaw(h("div", { style: { fontFamily: "monospace", background: bg, padding: 6 } },
@@ -268,6 +344,27 @@ export async function main(ns) {
                     btn("restart coord", () => { action = "restart"; }, hackColor),
                     btn("launch hud2", () => { action = "hud2"; }, titleColor),
                     btn("kill hud2", () => { action = "killhud2"; }, warnColor),
+                    btn("snapshot", () => {
+                        // download statusText as a timestamped .txt via pure browser APIs.
+                        // Safe inside an onClick (no ns calls). statusText is set each loop and
+                        // closure captures the outer-scope binding so click always sees the latest.
+                        try {
+                            const blob = new Blob([statusText], { type: "text/plain" });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement("a");
+                            a.href = url;
+                            a.download = "bb-status-" + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "") + ".txt";
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                        } catch (e) {
+                            // best-effort fallback: stash for terminal dump next loop via action queue.
+                            // ns.toast can't be called here -- the loop's action handler can't help either
+                            // since this isn't a recognized action. So just log to console for debug.
+                            console && console.error && console.error("snapshot download failed:", e);
+                        }
+                    }, incomeColor),
                 )
             ),
         ));
