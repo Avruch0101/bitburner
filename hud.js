@@ -145,7 +145,14 @@ export async function main(ns) {
         const ctrlRows = controllers.map(c => {
             let rt = 0;
             try { const rs = ns.getRunningScript(c.pid); if (rs) rt = rs.onlineRunningTime; } catch (e) {}
-            return { kind: c.kind, label: c.label, rt };
+            let st = null;
+            if (c.kind === "batch") {
+                try {
+                    const raw = ns.read("bstat-" + c.label + ".txt");
+                    if (raw) { const o = JSON.parse(raw); if (Date.now() - o.ts < 30000) st = o; }
+                } catch (e) {}
+            }
+            return { kind: c.kind, label: c.label, rt, st };
         }).sort((a, b) => (a.kind === b.kind) ? (b.rt - a.rt) : (a.kind === "coord" ? -1 : 1));
         const coordCount = controllers.filter(c => c.kind === "coord").length;
 
@@ -173,7 +180,11 @@ export async function main(ns) {
         if (ctrlRows.length) {
             lines.push("");
             lines.push("controllers" + (coordCount > 1 ? "  ** " + coordCount + " COORDS! **" : "") + ":");
-            for (const c of ctrlRows) lines.push("  " + (c.kind === "coord" ? "coord " : "batch ") + c.label + "  " + fmtDur(c.rt));
+            for (const c of ctrlRows) {
+                const s = c.st;
+                lines.push("  " + (c.kind === "coord" ? "coord " : "batch ") + pad(c.label, 14) + " " + fmtDur(c.rt)
+                    + (s ? "  fired " + grp(s.f) + "  skip " + grp(s.s) + "  resync " + grp(s.r) : (c.kind === "batch" ? "  (prep)" : "")));
+            }
         }
         const snapshot = lines.join("\n");
 
@@ -213,14 +224,23 @@ export async function main(ns) {
         const th = (s, align) => h("th", { style: { textAlign: align, padding: "2px 12px 4px 0", borderBottom: "1px solid " + muted, whiteSpace: "nowrap" } }, s);
         const td = (s, align) => h("td", { style: { textAlign: align, padding: "1px 12px 1px 0", whiteSpace: "nowrap" } }, s);
 
-        // --- REGION: controllers (coordinator + batchers) with uptimes; flags duplicate coordinators ---
+        // --- REGION: controllers (coordinator + batchers) with uptimes + batch counters; flags dupes/resyncs ---
         const ctrlTable = ctrlRows.length ? h("table", { style: { borderCollapse: "collapse", fontSize: "12px", marginBottom: "8px" } },
             h("thead", null, h("tr", null,
-                th(coordCount > 1 ? "CONTROLLERS  ** " + coordCount + " COORDS! **" : "CONTROLLERS", "left"),
-                th("UPTIME", "right"))),
-            h("tbody", null, ...ctrlRows.map((c, i) => h("tr", { key: "ctl" + i },
-                td((c.kind === "coord" ? "coord " : "batch ") + c.label, "left"),
-                td(fmtDur(c.rt), "right"))))
+                th(coordCount > 1 ? "CONTROLLERS ** " + coordCount + " COORDS! **" : "CONTROLLERS", "left"),
+                th("UPTIME", "right"), th("FIRED", "right"), th("SKIP", "right"), th("RESYNC", "right"))),
+            h("tbody", null, ...ctrlRows.map((c, i) => {
+                const s = c.st;
+                const resyncCell = s
+                    ? h("td", { style: { textAlign: "right", padding: "1px 12px 1px 0", whiteSpace: "nowrap", color: s.r > 0 ? "#e06c5c" : undefined, fontWeight: s.r > 0 ? 700 : undefined } }, grp(s.r))
+                    : td("", "right");
+                return h("tr", { key: "ctl" + i },
+                    td((c.kind === "coord" ? "coord " : "batch ") + c.label, "left"),
+                    td(fmtDur(c.rt), "right"),
+                    td(s ? grp(s.f) : (c.kind === "batch" ? "prep" : ""), "right"),
+                    td(s ? grp(s.s) : "", "right"),
+                    resyncCell);
+            }))
         ) : null;
         const farmBody = rowMeta.length
             ? rowMeta.map(r => h("tr", { key: r.t },

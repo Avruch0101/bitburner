@@ -5,7 +5,7 @@
  *   run killfarm.js
  */
 export async function main(ns) {
-  const workers = ["h.js", "prep.js", "bhack.js", "bgrow.js", "bweaken.js", "bprep.js"];
+  const workers = ["h.js", "prep.js", "bhack.js", "bgrow.js", "bweaken.js", "bprep.js", "bbatch2.js"];
   const seen = new Set(["home"]), q = ["home"], all = ["home"];
   while (q.length) { const c = q.shift(); for (const n of ns.scan(c)) if (!seen.has(n)) { seen.add(n); q.push(n); all.push(n); } }
   let killed = 0;

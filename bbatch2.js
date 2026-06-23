@@ -32,6 +32,11 @@ export async function main(ns) {
     const p = getParams(ns, target);
     const moneyPct = p.maxMoney > 0 ? p.curMoney / p.maxMoney : 1;
     const secOver = p.curSec - p.minSec;
+    // publish counters for the HUD (per-target stats file; HUD reads + staleness-checks via ts)
+    try {
+      ns.write("bstat-" + target + ".txt",
+        JSON.stringify({ f: fired, s: skipped, r: resyncs, m: +(moneyPct * 100).toFixed(1), sec: +secOver.toFixed(2), ts: Date.now() }), "w");
+    } catch (e) {}
 
     // --- drift detector: if the server has run off its prepped baseline, stop, clear in-flight
     // workers for this target, re-prep, and resume. Thresholds sit well outside the normal sawtooth. ---
