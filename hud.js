@@ -46,6 +46,7 @@ export async function main(ns) {
         const data = {};        // prep-and-hold per target
         const batchData = {};   // batch per target: { threads, income }
         const batchTargets = new Set();   // targets with a bbatch2 controller running
+        const controllers = [];           // {kind, label, pid} for coordinator.js + bbatch2.js instances
         const BATCH_WORKERS = new Set(["bhack.js", "bgrow.js", "bweaken.js"]);
         let totalPrep = 0, totalHack = 0, totalBatch = 0, rooted = 0, contracts = 0;
         for (const host of all) {
@@ -53,6 +54,8 @@ export async function main(ns) {
             try { contracts += ns.ls(host, ".cct").length; } catch (e) {}
             const hackHere = new Set();
             for (const p of ns.ps(host)) {
+                if (p.filename === "coordinator.js") { controllers.push({ kind: "coord", label: p.args.join(" "), pid: p.pid }); continue; }
+                if (p.filename === "bbatch2.js") { if (p.args[0]) batchTargets.add(p.args[0]); controllers.push({ kind: "batch", label: String(p.args[0] || "?"), pid: p.pid }); continue; }
                 const t = p.args[0];
                 if (!t) continue;
                 if (p.filename === "prep.js") {
@@ -68,8 +71,6 @@ export async function main(ns) {
                     if (!batchData[t]) batchData[t] = { threads: 0 };
                     batchData[t].threads += p.threads;
                     totalBatch += p.threads;
-                } else if (p.filename === "bbatch2.js") {
-                    batchTargets.add(t);
                 }
             }
             for (const t of hackHere) data[t].income += ns.getScriptIncome("h.js", host, t);
@@ -139,6 +140,15 @@ export async function main(ns) {
             return { t, mon, sec, threads: bd.threads, maxMoney: max, prepping: bd.threads === 0 };
         }).sort((a, b) => b.maxMoney - a.maxMoney);
 
+        // --- controller runtimes (coordinator + batchers): exposes duplicate coordinators, orphaned
+        // batchers, and whether a restart actually took (uptime resets to ~0) ---
+        const ctrlRows = controllers.map(c => {
+            let rt = 0;
+            try { const rs = ns.getRunningScript(c.pid); if (rs) rt = rs.onlineRunningTime; } catch (e) {}
+            return { kind: c.kind, label: c.label, rt };
+        }).sort((a, b) => (a.kind === b.kind) ? (b.rt - a.rt) : (a.kind === "coord" ? -1 : 1));
+        const coordCount = controllers.filter(c => c.kind === "coord").length;
+
         // --- text snapshot for the Copy button ---
         const lines = [];
         lines.push("L" + lvl + "  $" + fmt(cash) + "  income +$" + fmt(liveIncome) + "/s (batch +$" + fmt(batchIncome) + "/s)  share " + shareDisp);
@@ -159,6 +169,11 @@ export async function main(ns) {
                 lines.push(pad(r.t, 20) + padL(r.mon.toFixed(1), 6) + padL("+" + r.sec.toFixed(1), 7)
                     + padL(r.prepping ? "prep" : grp(r.threads), 9) + padL(fmt(r.maxMoney), 9));
             }
+        }
+        if (ctrlRows.length) {
+            lines.push("");
+            lines.push("controllers" + (coordCount > 1 ? "  ** " + coordCount + " COORDS! **" : "") + ":");
+            for (const c of ctrlRows) lines.push("  " + (c.kind === "coord" ? "coord " : "batch ") + c.label + "  " + fmtDur(c.rt));
         }
         const snapshot = lines.join("\n");
 
@@ -197,6 +212,16 @@ export async function main(ns) {
         // --- REGION: harvest table (prep-and-hold, per-target) ---
         const th = (s, align) => h("th", { style: { textAlign: align, padding: "2px 12px 4px 0", borderBottom: "1px solid " + muted, whiteSpace: "nowrap" } }, s);
         const td = (s, align) => h("td", { style: { textAlign: align, padding: "1px 12px 1px 0", whiteSpace: "nowrap" } }, s);
+
+        // --- REGION: controllers (coordinator + batchers) with uptimes; flags duplicate coordinators ---
+        const ctrlTable = ctrlRows.length ? h("table", { style: { borderCollapse: "collapse", fontSize: "12px", marginBottom: "8px" } },
+            h("thead", null, h("tr", null,
+                th(coordCount > 1 ? "CONTROLLERS  ** " + coordCount + " COORDS! **" : "CONTROLLERS", "left"),
+                th("UPTIME", "right"))),
+            h("tbody", null, ...ctrlRows.map((c, i) => h("tr", { key: "ctl" + i },
+                td((c.kind === "coord" ? "coord " : "batch ") + c.label, "left"),
+                td(fmtDur(c.rt), "right"))))
+        ) : null;
         const farmBody = rowMeta.length
             ? rowMeta.map(r => h("tr", { key: r.t },
                 td(r.t, "left"),
@@ -233,7 +258,7 @@ export async function main(ns) {
         // --- render the whole HUD as one tree ---
         ns.clearLog();
         ns.printRaw(h("div", { style: { fontFamily: "inherit", fontSize: "12px" } },
-            buttonsRegion, poolTable, farmTable, batchTable));
+            buttonsRegion, poolTable, ctrlTable, farmTable, batchTable));
 
         await ns.sleep(2000);
     }
@@ -251,6 +276,12 @@ function fmtRam(gb) {
     if (gb >= 1e6) return (gb / 1e6).toFixed(2) + " PB";
     if (gb >= 1e3) return (gb / 1e3).toFixed(1) + " TB";
     return Math.round(gb) + " GB";
+}
+function fmtDur(s) {
+    s = Math.floor(s);
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60 ? (s % 60) + "s" : "");
+    return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
 }
 function pad(s, n) { s = String(s); return s.length >= n ? s.slice(0, n) : s + " ".repeat(n - s.length); }
 function padL(s, n) { s = String(s); return s.length >= n ? s : " ".repeat(n - s.length) + s; }
