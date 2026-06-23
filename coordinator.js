@@ -10,7 +10,9 @@ export async function main(ns) {
                                  // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
     const BATCH_FLOOR = 10e9;    // a server must be at least this fat ($10b maxMoney) to deserve a batcher slot;
                                  // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
-    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 16;   // sparse/safe batch density (tune in-file)
+    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 6;    // density tuning. 16 was the safe default;
+                                 // 6 was confirmed empirically as the timing-density sweet spot for a 7-hour AFK run
+                                 // last session. Reset wiped that tuning (file reverted to 16); restored here.
                                  // HOME_RESERVE is computed per-loop below from the live batcher count (auto-sized).
     const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
@@ -37,8 +39,12 @@ export async function main(ns) {
     const XP_TARGET   = "joesguns";    // weaken target. low base sec -> fast cycles -> more XP/sec per thread.
                                        // any rooted low-level server works; joesguns is the traditional pick.
     const XP_WORKER   = "xpw.js";      // worker script -- MUST be added to pull.js or it won't deploy after pull
-    const XP_DEADBAND = 0.15;          // hysteresis: shrink xpw only when over target by >15% (no per-loop churn)
-    const XP_SLACK    = 4;             // threads of headroom left truly free on every host for reconcile slack
+    const XP_DEADBAND = 0.15;          // (legacy; no longer used after the immediate-shrink fix below.
+                                       // Kept as a const to preserve the existing tuning surface in case
+                                       // a future iteration wants it back on the grow path.)
+    const XP_SLACK    = 4;             // threads of headroom left truly free on every host. ALSO controls the
+                                       // grow-side deadband: xpw only grows when wantXpwT exceeds curXpwT by
+                                       // more than XP_SLACK threads, so small per-loop jitter doesn't churn.
     ns.disableLog("ALL");
 
     // --- singleton guard: kill any other copy of this coordinator (newest wins) ---
@@ -274,7 +280,13 @@ export async function main(ns) {
                     const wantXpwT = Math.floor(wantXpwRam / xpRam);
                     if (wantXpwT > curXpwT + XP_SLACK) {
                         ns.exec(XP_WORKER, h, wantXpwT - curXpwT, XP_TARGET);
-                    } else if (curXpwT > Math.ceil(wantXpwT * (1 + XP_DEADBAND)) + XP_SLACK) {
+                    } else if (curXpwT > wantXpwT) {
+                        // shrink to want immediately -- no deadband. The XP_DEADBAND constant existed to
+                        // shield against own-jitter (small per-loop variation in own thread count). It does
+                        // NOT belong on the cross-script case: when sharecap or a batcher expands and drives
+                        // wantXpwT down, that's a real signal and xpw must yield NOW, not 15% later. Holding
+                        // back here is what was starving sharecap (single-digit growth per loop) and forcing
+                        // bbatch2 fires to skip on RAM. Kill smallest workers first to minimize overshoot.
                         xpwProcs.sort((a, b) => a.threads - b.threads);
                         let cur = curXpwT;
                         for (const p of xpwProcs) {
