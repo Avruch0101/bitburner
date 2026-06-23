@@ -15,7 +15,7 @@ export async function main(ns) {
         "batch-math.js", "batch-live.js", "sharecap.js",
         "bhack.js", "bgrow.js", "bweaken.js",
         "bprep.js", "bdiag.js", "bbatch.js",
-        "pull.js", "killfarm.js", "bbatch2.js"
+        "pull.js", "killfarm.js", "bbatch2.js", "xpw.js"
     ];
     const base = "https://raw.githubusercontent.com/" + USER + "/" + REPO + "/" + BRANCH + "/";
     const running = new Set();
