@@ -239,7 +239,16 @@ export async function main(ns) {
                 const free = Math.floor(avail / workerRam);
                 if (free > 0) pool.push({ host: h, free });
             }
-            pool.sort((a, b) => b.free - a.free);
+            // Prefer CLOUD over home: place workers on cloud first, fall back to home only as overflow.
+            // place() consumes the pool in order, so sorting home to the end means prep/hack workers land
+            // on home only when all cloud capacity is full. This keeps home's non-reserved space genuinely
+            // free for the bbatch2 controllers (which are home-pinned at exec time) rather than clogged with
+            // a big prep.js crew. Within cloud, still fill biggest-free-first to minimize fragmentation.
+            pool.sort((a, b) => {
+                if (a.host === "home" && b.host !== "home") return 1;    // home sinks to the bottom
+                if (b.host === "home" && a.host !== "home") return -1;
+                return b.free - a.free;                                  // otherwise biggest-free-first
+            });
 
             // start deficits: hack first (income), then prep (harvest maintenance + digs). A deadband skips
             // sub-10% gaps so small crew-size drift between loops doesn't cause constant kill/restart churn.
