@@ -51,7 +51,7 @@ export async function main(ns) {
         for (const host of all) {
             if (ns.hasRootAccess(host)) rooted++;
             try { contracts += ns.ls(host, ".cct").length; } catch (e) {}
-            const hackHere = new Set(), bhackHere = new Set();
+            const hackHere = new Set();
             for (const p of ns.ps(host)) {
                 const t = p.args[0];
                 if (!t) continue;
@@ -65,20 +65,19 @@ export async function main(ns) {
                     totalHack += p.threads;
                     hackHere.add(t);
                 } else if (BATCH_WORKERS.has(p.filename)) {
-                    if (!batchData[t]) batchData[t] = { threads: 0, income: 0 };
+                    if (!batchData[t]) batchData[t] = { threads: 0 };
                     batchData[t].threads += p.threads;
                     totalBatch += p.threads;
-                    if (p.filename === "bhack.js") bhackHere.add(t);
                 } else if (p.filename === "bbatch2.js") {
                     batchTargets.add(t);
                 }
             }
             for (const t of hackHere) data[t].income += ns.getScriptIncome("h.js", host, t);
-            for (const t of bhackHere) {
-                if (!batchData[t]) batchData[t] = { threads: 0, income: 0 };
-                batchData[t].income += ns.getScriptIncome("bhack.js", host, t);
-            }
         }
+        // Per-target batch income isn't readable: batch workers run with a per-batch [target, msec] arg,
+        // so getScriptIncome(file, host, target) can't match them (returns -1). Measure batch income in
+        // aggregate instead: total script income minus harvest income (h.js + bhack.js are the only earners).
+        const harvestIncome = Object.values(data).reduce((s, d) => s + d.income, 0);
 
         // --- pool capacity (idle threads = free RAM now; total = idle + deployed) ---
         const workerRam = Math.max(ns.getScriptRam("prep.js", "home"), ns.getScriptRam("h.js", "home")) || 1.75;
@@ -131,15 +130,14 @@ export async function main(ns) {
 
         // --- batched targets (union of controllers + any running batch workers) ---
         const batchAll = new Set([...batchTargets, ...Object.keys(batchData)]);
-        let batchIncome = 0;
+        const batchIncome = Math.max(0, liveIncome - harvestIncome);
         const batchMeta = [...batchAll].map(t => {
-            const bd = batchData[t] || { threads: 0, income: 0 };
-            batchIncome += bd.income;
+            const bd = batchData[t] || { threads: 0 };
             const max = ns.getServerMaxMoney(t);
             const mon = max > 0 ? (ns.getServerMoneyAvailable(t) / max * 100) : 0;
             const sec = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
-            return { t, mon, sec, threads: bd.threads, income: bd.income, prepping: !batchData[t] || bd.threads === 0 };
-        }).sort((a, b) => (b.income - a.income) || (b.threads - a.threads));
+            return { t, mon, sec, threads: bd.threads, maxMoney: max, prepping: bd.threads === 0 };
+        }).sort((a, b) => b.maxMoney - a.maxMoney);
 
         // --- text snapshot for the Copy button ---
         const lines = [];
@@ -156,10 +154,10 @@ export async function main(ns) {
         }
         if (batchMeta.length) {
             lines.push("");
-            lines.push(pad("BATCH", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("THR", 9) + padL("$/s", 9));
+            lines.push(pad("BATCH", 20) + padL("MON%", 6) + padL("SEC", 7) + padL("THR", 9) + padL("MAX$", 9));
             for (const r of batchMeta) {
                 lines.push(pad(r.t, 20) + padL(r.mon.toFixed(1), 6) + padL("+" + r.sec.toFixed(1), 7)
-                    + padL(grp(r.threads), 9) + padL(r.prepping ? "prep" : fmt(r.income), 9));
+                    + padL(r.prepping ? "prep" : grp(r.threads), 9) + padL(fmt(r.maxMoney), 9));
             }
         }
         const snapshot = lines.join("\n");
@@ -222,12 +220,12 @@ export async function main(ns) {
                 td(r.t, "left"),
                 td(r.mon.toFixed(1), "right"),
                 td("+" + r.sec.toFixed(1), "right"),
-                td(grp(r.threads), "right"),
-                td(r.prepping ? "prep" : ("$" + fmt(r.income)), "right")));
+                td(r.prepping ? "prep" : grp(r.threads), "right"),
+                td("$" + fmt(r.maxMoney), "right")));
             batchTable = h("table", { style: { borderCollapse: "collapse", fontSize: "12px" } },
                 h("thead", null, h("tr", null,
                     th("BATCH", "left"), th("MON%", "right"), th("SEC", "right"),
-                    th("THREADS", "right"), th("$/s", "right"))),
+                    th("THREADS", "right"), th("MAX$", "right"))),
                 h("tbody", null, ...bbody)
             );
         }

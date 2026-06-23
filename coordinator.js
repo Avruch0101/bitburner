@@ -102,11 +102,14 @@ export async function main(ns) {
             // but ADMISSION stays on static max-money: the value floor is relative to the richest
             // earner (explicit max, not harvest[0]), so a server can't flip in/out of the set as
             // its score drifts -- that drift is exactly what would thrash the rebalance key.
-            // batch handoff: the top BATCH_TARGETS prepped servers by score go to their own bbatch2
-            // controllers (spawned after reconcile, below) and are removed from prep-and-hold here, so the
-            // coordinator deploys no prep/hack to them. digList already excludes them (they're prepped).
+            // batch handoff: the top BATCH_TARGETS prepped servers by MAX MONEY (fattest) go to their own
+            // bbatch2 controllers and are removed from prep-and-hold here. Ranked by value, NOT byScore:
+            // byScore is per-thread efficiency (favors low-level servers), but a batcher skims a fixed % of
+            // max money per batch, so batch income scales with the server's TOTAL value -- pick the fattest.
             const ranked = [...preppedSet].sort(byScore);
-            const batchSet = BATCH_TARGETS > 0 ? ranked.slice(0, BATCH_TARGETS) : [];
+            const batchSet = BATCH_TARGETS > 0
+                ? [...preppedSet].sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a)).slice(0, BATCH_TARGETS)
+                : [];
             const batchSetS = new Set(batchSet);
             let harvest = ranked.filter(t => !batchSetS.has(t));
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
