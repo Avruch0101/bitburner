@@ -302,7 +302,53 @@ export async function main(ns) {
             }
         }
         lines.push("");
-        lines.push("(faction/aug state not included -- launch hud2 for that)");
+        // --- try to read hud2's data file (written each hud2 render). If fresh, include faction
+        // and per-aug detail. hud1 stays Singularity-free; ns.read is base Netscript. ---
+        let hud2Read = null;
+        try {
+            const raw = ns.read("hud2-data.txt");
+            if (raw && raw.length > 0) hud2Read = JSON.parse(raw);
+        } catch (e) {}
+        if (!hud2Read) {
+            lines.push("(hud2 data file not found -- launch hud2 to capture faction/aug state)");
+        } else {
+            const age = Date.now() - (hud2Read.ts || 0);
+            if (age > 15000) {
+                lines.push("(hud2 data is stale by " + Math.floor(age / 1000) + "s -- hud2 not running)");
+            } else {
+                const n = hud2Read.nfg || {};
+                lines.push("NEUROFLUX");
+                lines.push("  level L" + (n.installed || 0) + (n.queued > 0 ? "  (+" + n.queued + " queued)" : ""));
+                if (n.nextRep !== null && n.nextCost !== null) {
+                    lines.push("  next:  rep " + fmt(n.nextRep) + "   $" + fmt(n.nextCost));
+                }
+                lines.push("");
+                const facs = hud2Read.factions || [];
+                lines.push("FACTIONS (" + facs.length + ")");
+                if (facs.length === 0) {
+                    lines.push("  (none joined)");
+                } else {
+                    for (const f of facs) {
+                        lines.push("  " + f.name.padEnd(22) +
+                            " rep " + fmt(f.rep).padStart(9) +
+                            "  favor " + (f.favor || 0).toFixed(1).padStart(6) +
+                            "  augs remaining " + (f.augs ? f.augs.length : 0));
+                        if (f.augs && f.augs.length > 0) {
+                            lines.push("    " + "aug".padEnd(34) + " rep req     cost      hacking mults");
+                            for (const a of f.augs) {
+                                const multStr = Object.entries(a.mults || {})
+                                    .map(([k, v]) => k.replace("hacking", "h") + " " + v.toFixed(2)).join(" ");
+                                lines.push("    " + a.name.padEnd(34) +
+                                    " " + fmt(a.rep).padStart(7) +
+                                    "  $" + fmt(a.cost).padStart(8) +
+                                    (multStr ? "   " + multStr : ""));
+                            }
+                        }
+                        lines.push("");
+                    }
+                }
+            }
+        }
         statusText = lines.join("\n");
 
         // --- render ---

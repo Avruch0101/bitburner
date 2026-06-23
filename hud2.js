@@ -41,15 +41,50 @@ export async function main(ns) {
             } catch (e) {}
         }
 
-        // per-faction: rep + augs left (excluding NFG, which is shown separately)
-        const facRows = [];
+        // per-faction: rep + favor + augs-remaining count + per-aug detail (for the snapshot file).
+        // Hacking-relevant multiplier keys to surface in per-aug detail.
+        const HACK_KEYS = ["hacking", "hacking_exp", "hacking_speed", "hacking_money", "hacking_chance", "hacking_grow"];
+        const facRows = [];          // for display: { fac, rep, favor, left }
+        const facDetail = [];        // for snapshot file: full per-aug detail
         for (const fac of factions) {
-            let rep = 0; try { rep = S.getFactionRep(fac); } catch (e) {}
-            let augs = []; try { augs = S.getAugmentationsFromFaction(fac); } catch (e) {}
-            const left = augs.filter(a => !ownedSet.has(a) && a !== NFG).length;
-            facRows.push({ fac, rep, left });
+            let rep = 0, favor = 0;
+            try { rep = S.getFactionRep(fac); } catch (e) {}
+            try { favor = S.getFactionFavor(fac); } catch (e) {}
+            let augs = [];
+            try { augs = S.getAugmentationsFromFaction(fac); } catch (e) {}
+            const unowned = augs.filter(a => !ownedSet.has(a) && a !== NFG);
+            facRows.push({ fac, rep, favor, left: unowned.length });
+
+            // per-aug detail for snapshot file
+            const augList = [];
+            for (const a of unowned) {
+                let r = 0, c = 0, stats = {};
+                try { r = S.getAugmentationRepReq(a); } catch (e) {}
+                try { c = S.getAugmentationPrice(a); } catch (e) {}
+                try { stats = S.getAugmentationStats(a); } catch (e) {}
+                const mults = {};
+                for (const k of HACK_KEYS) if (stats[k] && stats[k] !== 1) mults[k] = stats[k];
+                augList.push({ name: a, rep: r, cost: c, mults });
+            }
+            augList.sort((a, b) => a.rep - b.rep);   // by rep req ascending
+            facDetail.push({ name: fac, rep, favor, augs: augList });
         }
         facRows.sort((a, b) => b.rep - a.rep);
+
+        // --- write data file for hud1 snapshot button to pick up ---
+        try {
+            const data = {
+                ts: Date.now(),
+                nfg: {
+                    installed: nfgInstalled,
+                    queued: nfgPending,
+                    nextRep: isFinite(nfgNextRep) ? nfgNextRep : null,
+                    nextCost: isFinite(nfgNextCost) ? nfgNextCost : null,
+                },
+                factions: facDetail,
+            };
+            ns.write("hud2-data.txt", JSON.stringify(data), "w");
+        } catch (e) {}
 
         // theme
         let theme = {};
@@ -85,13 +120,15 @@ export async function main(ns) {
                 )
             ),
             panel("FACTIONS",
-                h("div", { style: { display: "grid", gridTemplateColumns: "1fr auto auto", columnGap: 12, rowGap: 2, fontSize: 12 } },
+                h("div", { style: { display: "grid", gridTemplateColumns: "1fr auto auto auto", columnGap: 12, rowGap: 2, fontSize: 12 } },
                     h("span", { style: { color: muted, fontSize: 10, letterSpacing: 0.5 } }, "FACTION"),
                     h("span", { style: { color: muted, fontSize: 10, letterSpacing: 0.5, textAlign: "right" } }, "REP"),
+                    h("span", { style: { color: muted, fontSize: 10, letterSpacing: 0.5, textAlign: "right" } }, "FAV"),
                     h("span", { style: { color: muted, fontSize: 10, letterSpacing: 0.5, textAlign: "right" } }, "AUGS"),
                     ...facRows.flatMap(r => [
                         h("span", { key: r.fac + ":n", style: { color: hackColor } }, r.fac),
                         h("span", { key: r.fac + ":r", style: { textAlign: "right" } }, fmt(r.rep)),
+                        h("span", { key: r.fac + ":f", style: { textAlign: "right", color: r.favor > 0 ? moneyColor : muted } }, r.favor.toFixed(1)),
                         h("span", { key: r.fac + ":a", style: { textAlign: "right", color: r.left > 0 ? moneyColor : muted } }, r.left),
                     ])
                 )
