@@ -2,12 +2,15 @@
 export async function main(ns) {
     const numTargets   = Number(ns.args[0]) || 6;     // max targets to bring online
     const levelRatio   = Number(ns.args[1]) || 0.5;   // target required-level <= ratio * your level
-    const BATCH_TARGETS = Number(ns.args[3]) || 0;    // top-value PREPPED servers to hand to bbatch2 (0 = off).
-                                 // 4th CLI arg: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchTargets>`.
-                                 // These are dropped from prep-and-hold and run on overlapping HWGW batches instead.
+    const BATCH_MAX = ns.args[3] !== undefined ? Number(ns.args[3]) : 7;   // CAP on batchers (0 = batching off).
+                                 // The ACTUAL count auto-adjusts each loop: min(BATCH_MAX, number of PREPPED servers
+                                 // worth batching, i.e. maxMoney >= BATCH_FLOOR). So a cold start runs at 0 batchers
+                                 // on its own and ramps up as fat servers prep -- no manual 0->5 dance on restart.
+                                 // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
+    const BATCH_FLOOR = 10e9;    // a server must be at least this fat ($10b maxMoney) to deserve a batcher slot;
+                                 // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
     const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 16;   // sparse/safe batch density (tune in-file)
-    const HOME_RESERVE = 24 + 14 * BATCH_TARGETS;   // GB kept free on home: coordinator + diagnostics, plus room
-                                 // for each bbatch2 controller (~11-14GB) that runs on home
+                                 // HOME_RESERVE is computed per-loop below from the live batcher count (auto-sized).
     const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
@@ -102,15 +105,19 @@ export async function main(ns) {
             // but ADMISSION stays on static max-money: the value floor is relative to the richest
             // earner (explicit max, not harvest[0]), so a server can't flip in/out of the set as
             // its score drifts -- that drift is exactly what would thrash the rebalance key.
-            // batch handoff: the top BATCH_TARGETS prepped servers by MAX MONEY (fattest) go to their own
+            // batch handoff: the fattest prepped servers (up to BATCH_MAX) by MAX MONEY (fattest) go to their own
             // bbatch2 controllers and are removed from prep-and-hold here. Ranked by value, NOT byScore:
             // byScore is per-thread efficiency (favors low-level servers), but a batcher skims a fixed % of
             // max money per batch, so batch income scales with the server's TOTAL value -- pick the fattest.
             const ranked = [...preppedSet].sort(byScore);
-            const batchSet = BATCH_TARGETS > 0
-                ? [...preppedSet].sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a)).slice(0, BATCH_TARGETS)
-                : [];
+            // auto batch count: the fattest PREPPED servers above BATCH_FLOOR, capped at BATCH_MAX. Cold start has
+            // nothing above the floor -> 0 batchers; as megacorps prep they cross the floor and slots fill on their own.
+            const fatPrepped = [...preppedSet]
+                .filter(t => ns.getServerMaxMoney(t) >= BATCH_FLOOR)
+                .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
+            const batchSet = BATCH_MAX > 0 ? fatPrepped.slice(0, BATCH_MAX) : [];
             const batchSetS = new Set(batchSet);
+            const HOME_RESERVE = 24 + 14 * batchSet.length;   // auto-sized to the live batcher count
             let harvest = ranked.filter(t => !batchSetS.has(t));
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
@@ -203,7 +210,7 @@ export async function main(ns) {
             // --- batch controllers: ensure one bbatch2 per batch target; drop stale ones. The reconcile
             // pass above already cleared any prep/hold workers from servers that just entered batchSet, so
             // the batcher takes over a clean server. bbatch2 self-preps and self-corrects from here. ---
-            if (BATCH_TARGETS > 0) {
+            if (BATCH_MAX > 0) {
                 const runningBatchers = new Map();   // target -> pid
                 for (const p of ns.ps("home")) if (p.filename === "bbatch2.js" && p.args[0]) runningBatchers.set(p.args[0], p.pid);
                 for (const t of batchSet) {
