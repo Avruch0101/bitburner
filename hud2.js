@@ -75,6 +75,7 @@ export async function main(ns) {
         try {
             const data = {
                 ts: Date.now(),
+                installed: installed.slice().sort(),   // full installed list (NFG appears N times if stacked)
                 nfg: {
                     installed: nfgInstalled,
                     queued: nfgPending,

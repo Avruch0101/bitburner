@@ -316,6 +316,18 @@ export async function main(ns) {
             if (age > 15000) {
                 lines.push("(hud2 data is stale by " + Math.floor(age / 1000) + "s -- hud2 not running)");
             } else {
+                // installed augs -- collapse repeated NFG entries to a count
+                const inst = hud2Read.installed || [];
+                const nfgCount = inst.filter(a => a === "NeuroFlux Governor").length;
+                const others = inst.filter(a => a !== "NeuroFlux Governor");
+                lines.push("INSTALLED (" + inst.length + " total: " + others.length + " unique + NFG L" + nfgCount + ")");
+                if (others.length === 0 && nfgCount === 0) {
+                    lines.push("  (none)");
+                } else {
+                    for (const a of others) lines.push("  " + a);
+                    if (nfgCount > 0) lines.push("  NeuroFlux Governor L" + nfgCount);
+                }
+                lines.push("");
                 const n = hud2Read.nfg || {};
                 lines.push("NEUROFLUX");
                 lines.push("  level L" + (n.installed || 0) + (n.queued > 0 ? "  (+" + n.queued + " queued)" : ""));
