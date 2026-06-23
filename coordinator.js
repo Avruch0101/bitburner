@@ -1,7 +1,8 @@
 /** @param {NS} ns */
 export async function main(ns) {
-    const numTargets   = Number(ns.args[0]) || 6;     // max targets to bring online
-    const levelRatio   = Number(ns.args[1]) || 0.5;   // target required-level <= ratio * your level
+    const numTargets   = Number(ns.args[0]) || 40;    // max harvest targets (high default; the value-floor + level
+                                 // gates below filter, so a high cap just stops artificially starving harvest)
+    const levelRatio   = Number(ns.args[1]) || 0.9;   // target required-level <= ratio * your level (0.9 leaves a
     const BATCH_MAX = ns.args[3] !== undefined ? Number(ns.args[3]) : 7;   // CAP on batchers (0 = batching off).
                                  // The ACTUAL count auto-adjusts each loop: min(BATCH_MAX, number of PREPPED servers
                                  // worth batching, i.e. maxMoney >= BATCH_FLOOR). So a cold start runs at 0 batchers
@@ -9,16 +10,16 @@ export async function main(ns) {
                                  // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
     const BATCH_FLOOR = 10e9;    // a server must be at least this fat ($10b maxMoney) to deserve a batcher slot;
                                  // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
-    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 6;   // sparse/safe batch density (tune in-file)
+    const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 16;   // sparse/safe batch density (tune in-file)
                                  // HOME_RESERVE is computed per-loop below from the live batcher count (auto-sized).
     const STEAL_FRAC   = 0.25;   // fraction of a target's money each hack pass skims; one knob for every server
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
-    const DIG_TARGETS  = Number(ns.args[2]) || 6;   // cold servers to prep IN PARALLEL (each capped). This is
-                                 // PREP THROUGHPUT (how fast harvest fills), distinct from numTargets (harvest cap).
-                                 // 3rd CLI arg: `run coordinator.js <numTargets> <levelRatio> <digTargets>`. Raise to
-                                 // fill harvest faster / use more idle pool; each dig is bounded by DIG_PREP_CAP.
+    const DIG_TARGETS_ARG = ns.args[2] !== undefined ? Number(ns.args[2]) : 0;   // 0/omitted = AUTO: digCount scales
+                                 // with the pool (computed in-loop), so prep parallelism grows as the rebuild does.
+                                 // PREP THROUGHPUT: how many cold servers prep in parallel. Pass an explicit 3rd arg
+                                 // to override the auto value with a fixed count.
     const DIG_PREP_CAP = 40000;  // flat ceiling on prep threads per dig target. A server's prep need is set by
                                  // its OWN economics, not the pool size -- 4% of a 270k pool was still 11k, far
                                  // more than any BN1 server needs at min security. growthAnalyze (no Formulas)
@@ -122,6 +123,18 @@ export async function main(ns) {
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
                              .slice(0, numTargets + STICKY_EXTRA);
+            // pool capacity (threads) -- computed here so digCount can scale prep parallelism to the live pool.
+            const workerRam = Math.max(ns.getScriptRam(PREP, "home"), ns.getScriptRam(HACK, "home")) || 1.75;
+            let totalCap = 0;
+            for (const h of all.concat("home")) {
+                if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
+                let cap = ns.getServerMaxRam(h);
+                if (h === "home") cap -= HOME_RESERVE;
+                totalCap += Math.max(0, Math.floor(cap / workerRam));
+            }
+            // auto dig parallelism: scale with the pool, clamped [6,20]. Bigger pool -> prep more cold servers at
+            // once -> faster rebuild. ~10k threads budgeted per dig (covers a megacorp's cold need). Arg overrides.
+            const digCount = DIG_TARGETS_ARG > 0 ? DIG_TARGETS_ARG : Math.max(6, Math.min(20, Math.floor(totalCap / 10000)));
             // dig list: the cold servers we actively prep THIS cycle, in parallel, each capped to its
             // own need (pass 3 below). Capping + parallelism replaces "pour the whole pool into one
             // focus" -- at a 100k+ thread pool that wasted nearly all of it on a server needing a few hundred.
@@ -131,21 +144,13 @@ export async function main(ns) {
             if (harvest.length === 0) {
                 digList = eligible.filter(t => !preppedSet.has(t))
                     .sort((a, b) => prepCost(ns, a) - prepCost(ns, b))
-                    .slice(0, DIG_TARGETS);
+                    .slice(0, digCount);
             } else {
-                digList = top.filter(t => !preppedSet.has(t)).slice(0, DIG_TARGETS);
+                digList = top.filter(t => !preppedSet.has(t)).slice(0, digCount);
             }
 
             // --- desired plan: per-target thread targets (harvest = hack+prep crew; digs = capped prep) ---
-            const workerRam = Math.max(ns.getScriptRam(PREP, "home"), ns.getScriptRam(HACK, "home")) || 1.75;
-            // full capacity (for HACK_CAP), independent of current deployment so the cap doesn't shrink as we fill
-            let totalCap = 0;
-            for (const h of all.concat("home")) {
-                if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
-                let cap = ns.getServerMaxRam(h);
-                if (h === "home") cap -= HOME_RESERVE;
-                totalCap += Math.max(0, Math.floor(cap / workerRam));
-            }
+            // (workerRam + totalCap computed above for digCount; reused here for the hack cap)
             const HACK_CAP = Math.max(1, Math.floor(totalCap * 0.20));   // no single target hogs >20% on hack
             const crews = {};
             for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
