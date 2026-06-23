@@ -137,11 +137,11 @@ export async function main(ns) {
                 .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a));
             const batchSet = BATCH_MAX > 0 ? fatPrepped.slice(0, BATCH_MAX) : [];
             const batchSetS = new Set(batchSet);
-            const HOME_RESERVE = 40 + 14 * batchSet.length;   // auto-sized to the live batcher count.
-                                                              // 40 GB base ensures non-coord scripts (sing,
-                                                              // hud1, hud2, etc.) always have room to launch
-                                                              // without juggling. Coord won't claim it for
-                                                              // workers; other scripts can still use it.
+            // Reserve 25% of home RAM (minimum 40 GB) for non-coord scripts, plus 14 GB per batcher.
+            // The percentage scales automatically as home grows; the floor protects against tiny-home
+            // edge cases. Coord won't claim this space for workers; sing/hud/etc. can still use it.
+            const HOME_MAX = ns.getServerMaxRam("home");
+            const HOME_RESERVE = Math.max(40, Math.floor(HOME_MAX * 0.25)) + 14 * batchSet.length;
             let harvest = ranked.filter(t => !batchSetS.has(t));
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
