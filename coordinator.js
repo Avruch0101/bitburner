@@ -8,8 +8,11 @@ export async function main(ns) {
                                  // worth batching, i.e. maxMoney >= BATCH_FLOOR). So a cold start runs at 0 batchers
                                  // on its own and ramps up as fat servers prep -- no manual 0->5 dance on restart.
                                  // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
-    const BATCH_FLOOR = 10e9;    // a server must be at least this fat ($10b maxMoney) to deserve a batcher slot;
+    const BATCH_FLOOR = 1e9;     // a server must be at least this fat ($1b maxMoney) to deserve a batcher slot;
                                  // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
+                                 // LOWERED from $10b for BN4: server money is cut ~75-80%, so the fattest servers
+                                 // top out around $4b here (global-pharm). $10b stranded every server below the
+                                 // floor -> 0 batchers permanently. $1b captures the top ~13-server fat cluster.
     const BATCH_FRAC = 0.05, BATCH_GAP = 200, BATCH_PERIOD_MULT = 6;    // density tuning. 16 was the safe default;
                                  // 6 was confirmed empirically as the timing-density sweet spot for a 7-hour AFK run
                                  // last session. Reset wiped that tuning (file reverted to 16); restored here.
@@ -162,7 +165,29 @@ export async function main(ns) {
                     .sort((a, b) => prepCost(ns, a) - prepCost(ns, b))
                     .slice(0, digCount);
             } else {
-                digList = top.filter(t => !preppedSet.has(t)).slice(0, digCount);
+                // byScore-ranked digs (favors small efficient servers -- fast income rebuild)
+                const scoreDigs = top.filter(t => !preppedSet.has(t));
+                // FAT-PREP RESERVATION: byScore starves the fat $1b+ servers (high req level = poor
+                // per-thread efficiency), so they never prep and never become batch-eligible -- batchers
+                // stay at 0 forever. Reserve up to BATCH_MAX dig slots for the fattest unprepped servers
+                // above BATCH_FLOOR, ranked by MAX MONEY, so the future batch targets actually get prepped.
+                // These interleave with the byScore digs rather than replacing them.
+                // SOURCED FROM rootedMoney (reqLevel <= L), NOT eligible (reqLevel <= 0.9*L): the ratio
+                // filter excludes fat servers in the 0.9L..L band (e.g. at L199 it cuts everything needing
+                // 180-199), which is exactly the fat cluster we need to prep. Prep (grow/weaken) works at
+                // any level; only hacking is level-gated, and rootedMoney already excludes servers above L.
+                const fatUnprepped = BATCH_MAX > 0
+                    ? rootedMoney.filter(t => !preppedSet.has(t) && ns.getServerMaxMoney(t) >= BATCH_FLOOR)
+                              .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a))
+                              .slice(0, BATCH_MAX)
+                    : [];
+                // merge: fat servers first (priority prep), then byScore digs, dedup, cap at digCount.
+                // Fat-first ensures the batch pipeline fills even when digCount is small.
+                const merged = [];
+                const seen = new Set();
+                for (const t of fatUnprepped) { if (!seen.has(t)) { seen.add(t); merged.push(t); } }
+                for (const t of scoreDigs)    { if (!seen.has(t)) { seen.add(t); merged.push(t); } }
+                digList = merged.slice(0, digCount);
             }
 
             // --- desired plan: per-target thread targets (harvest = hack+prep crew; digs = capped prep) ---
