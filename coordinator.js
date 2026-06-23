@@ -29,6 +29,16 @@ export async function main(ns) {
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const PREP = "prep.js", HACK = "h.js";
+    // --- XP farm: fill leftover idle RAM with weaken() for hacking XP. The harvest/dig/batch placements
+    //     run their normal course; xpw is a tail filler that takes whatever pool is left and gives it back
+    //     when those need to grow. Hacking XP only -- weaken/grow/hack don't train combat stats. Combat
+    //     requires gym/crime, which without Singularity (SF4) is a manual UI activity in BN1.
+    const XP_ENABLE   = true;          // master switch. false disables fill and lets existing xpw workers die off
+    const XP_TARGET   = "joesguns";    // weaken target. low base sec -> fast cycles -> more XP/sec per thread.
+                                       // any rooted low-level server works; joesguns is the traditional pick.
+    const XP_WORKER   = "xpw.js";      // worker script -- MUST be added to pull.js or it won't deploy after pull
+    const XP_DEADBAND = 0.15;          // hysteresis: shrink xpw only when over target by >15% (no per-loop churn)
+    const XP_SLACK    = 4;             // threads of headroom left truly free on every host for reconcile slack
     ns.disableLog("ALL");
 
     // --- singleton guard: kill any other copy of this coordinator (newest wins) ---
@@ -235,6 +245,45 @@ export async function main(ns) {
                     + (batchSet.length ? "  batch[" + batchSet.length + "] " + batchSet.join(",") : "")
                     + "  dig[" + digList.length + "] " + (digList.join(",") || "(none)")
                     + "  cap " + totalCap + "t  idle " + idle + "t");
+            }
+
+            // --- PHASE 2: XP fill. Run AFTER harvest/dig/batch placement so it consumes only true leftovers.
+            // For each rooted host: sum xpw threads (curXpwT) and infer non-xpw used RAM. Compute the xpw
+            // capacity that fits in (maxRam - nonXpwUsed - reserve - slack). Grow with one exec when below
+            // target by more than the slack; shrink (smallest workers first) only when above target by the
+            // deadband (15%). The deadband is what stops every tiny per-loop crew drift from churning xpw.
+            // If XP_ENABLE is flipped off mid-run, this branch goes idle and the existing xpw workers stay
+            // up until reconcile pressure pushes them out via the shrink path being unreachable -- to kill
+            // them off immediately, set XP_TARGET to an unreachable name and they'll be killed as off-target.
+            if (XP_ENABLE && ns.hasRootAccess(XP_TARGET)) {
+                const xpRam = ns.getScriptRam(XP_WORKER, "home") || 1.75;
+                for (const h of all.concat("home")) {
+                    if (!ns.hasRootAccess(h) || ns.getServerMaxRam(h) <= 0) continue;
+                    if (!ns.fileExists(XP_WORKER, h)) ns.scp([XP_WORKER], h, "home");
+                    // kill any xpw still pointing at a stale target (so re-targeting takes effect next loop)
+                    for (const p of ns.ps(h)) {
+                        if (p.filename === XP_WORKER && p.args[0] !== XP_TARGET) ns.kill(p.pid);
+                    }
+                    const xpwProcs = ns.ps(h).filter(p => p.filename === XP_WORKER && p.args[0] === XP_TARGET);
+                    const curXpwT = xpwProcs.reduce((s, p) => s + p.threads, 0);
+                    const curXpwRam = curXpwT * xpRam;
+                    // non-xpw used RAM == everything harvest/dig/batch is using on this host right now
+                    const nonXpwUsed = ns.getServerUsedRam(h) - curXpwRam;
+                    const reserve = (h === "home" ? HOME_RESERVE : 0) + XP_SLACK * workerRam;
+                    const wantXpwRam = Math.max(0, ns.getServerMaxRam(h) - nonXpwUsed - reserve);
+                    const wantXpwT = Math.floor(wantXpwRam / xpRam);
+                    if (wantXpwT > curXpwT + XP_SLACK) {
+                        ns.exec(XP_WORKER, h, wantXpwT - curXpwT, XP_TARGET);
+                    } else if (curXpwT > Math.ceil(wantXpwT * (1 + XP_DEADBAND)) + XP_SLACK) {
+                        xpwProcs.sort((a, b) => a.threads - b.threads);
+                        let cur = curXpwT;
+                        for (const p of xpwProcs) {
+                            if (cur <= wantXpwT) break;
+                            ns.kill(p.pid);
+                            cur -= p.threads;
+                        }
+                    }
+                }
             }
         } catch (e) {
             ns.print("loop error: " + e);
