@@ -40,6 +40,37 @@ export async function main(ns) {
                 } else if (action === "killhud2") {
                     const killed = ns.scriptKill("hud2.js", "home");
                     ns.toast(killed ? "killed hud2" : "hud2 not running", killed ? "info" : "warning", 2000);
+                } else if (action === "killshare") {
+                    // fleet-wide kill of the share system: sharecap.js (controller, on home) AND
+                    // all sh.js workers (the actual RAM consumers, spread across the fleet). Killing
+                    // only the controller would orphan the workers, leaving their RAM held with no
+                    // manager -- so we must sweep sh.js across every host. Leaves coord, prep/h
+                    // workers, sing, huds untouched.
+                    let ctrl = ns.scriptKill("sharecap.js", "home");
+                    let workerProcs = 0;
+                    for (const host of all) {
+                        for (const p of ns.ps(host)) {
+                            if (p.filename === "sh.js") { ns.kill(p.pid); workerProcs++; }
+                        }
+                    }
+                    ns.toast("killed share: controller " + (ctrl ? "yes" : "no") + ", " + workerProcs + " sh.js worker proc(s)", "success", 3000);
+                } else if (action === "killcoord") {
+                    // kill the coordinator process only. Its prep/h workers keep running (self-loop);
+                    // restart coord later to re-adopt them. Use for the sharecap boot-order dance.
+                    const killed = ns.scriptKill("coordinator.js", "home");
+                    ns.toast(killed ? "killed coord (workers still running)" : "coord not running", killed ? "success" : "warning", 2500);
+                } else if (action === "resetcoord") {
+                    // full reset: kill coord AND all prep/h workers fleet-wide for a clean re-allocation.
+                    // Does NOT auto-restart -- you restart coord (or via the restart button) to re-place
+                    // from scratch. Use when you want better server selection, not just a process bounce.
+                    ns.scriptKill("coordinator.js", "home");
+                    let killed = 0;
+                    for (const host of all) {
+                        for (const p of ns.ps(host)) {
+                            if (p.filename === "prep.js" || p.filename === "h.js") { ns.kill(p.pid); killed++; }
+                        }
+                    }
+                    ns.toast("reset coord + killed " + killed + " worker proc(s) -- restart coord now", "success", 3500);
                 }
             } catch (e) { ns.toast("action error: " + e, "error", 4000); }
             action = null;
@@ -58,14 +89,25 @@ export async function main(ns) {
         const batchTargets = new Set();
         const controllers = [];
         const BATCH_WORKERS = new Set(["bhack.js", "bgrow.js", "bweaken.js"]);
+        const scriptTally = {};     // filename -> { threads, ramGB } across ALL hosts (every process)
         let totalPrep = 0, totalHack = 0, totalBatch = 0, rooted = 0, contracts = 0;
+        let shareThreads = 0;       // aggregate sh.js worker threads across the fleet
         for (const host of all) {
             if (ns.hasRootAccess(host)) rooted++;
             try { contracts += ns.ls(host, ".cct").length; } catch (e) {}
             const hackHere = new Set();
             for (const p of ns.ps(host)) {
+                // global per-script tally -- catches EVERYTHING (share, orphans, controllers, workers)
+                if (!scriptTally[p.filename]) scriptTally[p.filename] = { threads: 0, ramGB: 0 };
+                scriptTally[p.filename].threads += p.threads;
+                let perThreadRam = 0;
+                try { perThreadRam = ns.getScriptRam(p.filename, host); } catch (e) {}
+                scriptTally[p.filename].ramGB += perThreadRam * p.threads;
+
                 if (p.filename === "coordinator.js") { controllers.push({ kind: "coord", label: p.args.join(" "), pid: p.pid }); continue; }
                 if (p.filename === "bbatch2.js") { if (p.args[0]) batchTargets.add(p.args[0]); controllers.push({ kind: "batch", label: String(p.args[0] || "?"), pid: p.pid }); continue; }
+                if (p.filename === "sharecap.js") { controllers.push({ kind: "share", label: "", pid: p.pid }); continue; }
+                if (p.filename === "sh.js") { shareThreads += p.threads; continue; }
                 const t = p.args[0];
                 if (!t) continue;
                 if (p.filename === "prep.js") {
@@ -221,11 +263,15 @@ export async function main(ns) {
         }, label);
 
         // controller uptime via getRunningScript
+        const ctrlLabel = (c) => (c.kind === "coord" ? "coord " : c.kind === "batch" ? "batch " : c.kind === "share" ? "share " : c.kind + " ") + c.label;
+        // share controller label was left blank during scan; fill it with the aggregate sh.js
+        // worker thread count (the meaningful number -- the controller itself is 1 thread on home).
+        for (const c of controllers) if (c.kind === "share") c.label = shareThreads + "t workers";
         const ctrlRows = controllers.map(c => {
             let up = "?";
             try { const info = ns.getRunningScript(c.pid); if (info) up = fmtTime(info.onlineRunningTime); } catch (e) {}
             return h("div", { key: c.pid, style: { display: "flex", justifyContent: "space-between", fontSize: 11 } },
-                h("span", null, c.kind === "coord" ? ("coord " + c.label) : ("batch " + c.label)),
+                h("span", null, ctrlLabel(c)),
                 h("span", { style: { color: muted } }, up)
             );
         });
@@ -249,6 +295,18 @@ export async function main(ns) {
         lines.push("THREADS");
         lines.push("  deployed " + deployed + "  batch " + totalBatch + "  idle " + idle + "  total " + total);
         lines.push("  harvest income $" + fmt(harvestIncome) + "/s   batch income $" + fmt(batchIncome) + "/s");
+        lines.push("");
+        // per-script RAM+thread breakdown -- reveals what's actually consuming the fleet
+        // (share workers, orphaned crews, controllers). Sorted by RAM descending.
+        lines.push("RAM BY SCRIPT");
+        const tallyRows = Object.entries(scriptTally).sort((a, b) => b[1].ramGB - a[1].ramGB);
+        if (tallyRows.length === 0) {
+            lines.push("  (nothing running)");
+        } else {
+            for (const [fn, t] of tallyRows) {
+                lines.push("  " + fn.padEnd(20) + String(t.threads).padStart(7) + " threads   " + fmtGB(t.ramGB).padStart(9));
+            }
+        }
         lines.push("");
         lines.push("HARVEST (" + harvestServers + " server" + (harvestServers === 1 ? "" : "s") + ")");
         if (harvestServers === 0) {
@@ -298,7 +356,7 @@ export async function main(ns) {
             for (const c of controllers) {
                 let up = "?";
                 try { const info = ns.getRunningScript(c.pid); if (info) up = fmtTime(info.onlineRunningTime); } catch (e) {}
-                lines.push("  " + (c.kind === "coord" ? "coord " + c.label : "batch " + c.label).padEnd(28) + up);
+                lines.push("  " + ctrlLabel(c).padEnd(28) + up);
             }
         }
         lines.push("");
@@ -316,24 +374,25 @@ export async function main(ns) {
             if (age > 15000) {
                 lines.push("(hud2 data is stale by " + Math.floor(age / 1000) + "s -- hud2 not running)");
             } else {
-                // installed augs -- collapse NFG entries (any variant of "NeuroFlux Governor[...]")
-                // to a single line with the level count. NFG instances may be stored as bare name
-                // or with "- Level N" suffix; substring match catches all of them.
+                // installed augs -- NFG appears at most once in the array regardless of stacked level;
+                // the real level comes from hud2's rep-req-derived nfg.level field. Filter NFG out of
+                // the per-aug list and append it as "NeuroFlux Governor LN" using the derived level.
                 const inst = hud2Read.installed || [];
-                const nfgCount = inst.filter(a => a.startsWith("NeuroFlux Governor")).length;
                 const others = inst.filter(a => !a.startsWith("NeuroFlux Governor"));
-                lines.push("INSTALLED (" + inst.length + " total: " + others.length + " unique + NFG L" + nfgCount + ")");
-                if (others.length === 0 && nfgCount === 0) {
+                const nfgLvl = (hud2Read.nfg && hud2Read.nfg.level) || 0;
+                const totalCount = others.length + (nfgLvl > 0 ? nfgLvl : 0);
+                lines.push("INSTALLED (" + totalCount + " total: " + others.length + " unique + NFG L" + nfgLvl + ")");
+                if (others.length === 0 && nfgLvl === 0) {
                     lines.push("  (none)");
                 } else {
                     for (const a of others) lines.push("  " + a);
-                    if (nfgCount > 0) lines.push("  NeuroFlux Governor L" + nfgCount);
+                    if (nfgLvl > 0) lines.push("  NeuroFlux Governor L" + nfgLvl);
                 }
                 lines.push("");
                 const n = hud2Read.nfg || {};
                 lines.push("NEUROFLUX");
-                lines.push("  level L" + (n.installed || 0) + (n.queued > 0 ? "  (+" + n.queued + " queued)" : ""));
-                if (n.nextRep !== null && n.nextCost !== null) {
+                lines.push("  level L" + nfgLvl);
+                if (n.nextRep !== null && n.nextRep !== undefined && n.nextCost !== null && n.nextCost !== undefined) {
                     lines.push("  next:  rep " + fmt(n.nextRep) + "   $" + fmt(n.nextCost));
                 }
                 lines.push("");
@@ -402,6 +461,9 @@ export async function main(ns) {
                     btn("pull", () => { action = "pull"; }, hackColor),
                     btn("puzzles", () => { action = "puzzles"; }, hackColor),
                     btn("restart coord", () => { action = "restart"; }, hackColor),
+                    btn("kill coord", () => { action = "killcoord"; }, warnColor),
+                    btn("reset coord", () => { action = "resetcoord"; }, warnColor),
+                    btn("kill share", () => { action = "killshare"; }, warnColor),
                     btn("launch hud2", () => { action = "hud2"; }, titleColor),
                     btn("kill hud2", () => { action = "killhud2"; }, warnColor),
                     btn("snapshot", () => {
