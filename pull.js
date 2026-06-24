@@ -6,7 +6,7 @@ export async function main(ns) {
   const BRANCH = "main";
   // pull.js is fetched LAST: a running script can't reload its own code.
   const files = [
-    "coordinator.js", "prep.js", "h.js",
+    "coordinator.js", "prep.js", "h.js", "boot.js",
     "farm-status.js", "status.js", "hud.js",
     "puzzles.js", "purchaser.js", "cleanup.js",
     "xp.js", "xpfarm.js", "sh.js", "shareall.js",

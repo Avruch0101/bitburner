@@ -25,6 +25,12 @@ export async function main(ns) {
                 if (action === "pull") {
                     const pid = ns.run("pull.js");
                     ns.toast(pid ? "running pull.js" : "pull.js not found", pid ? "info" : "error", 2500);
+                } else if (action === "coldstart") {
+                    // run boot.js -- the single source of truth for the cold-start launch sequence
+                    // (sharecap-before-coord ordering, sing/purchaser/coord/hud1). hud1 stays running;
+                    // boot.js detects it and won't relaunch or kill it.
+                    const pid = ns.run("boot.js");
+                    ns.toast(pid ? "running boot.js (cold-start bootstrap)" : "boot.js not found", pid ? "success" : "error", 3000);
                 } else if (action === "puzzles") {
                     const pid = ns.run("puzzles.js");
                     ns.toast(pid ? "running puzzles.js" : "puzzles.js not found", pid ? "info" : "error", 2500);
@@ -489,6 +495,7 @@ export async function main(ns) {
             ),
             panel("CONTROLS",
                 h("div", { style: { display: "flex", flexWrap: "wrap" } },
+                    btn("COLD START", () => { action = "coldstart"; }, incomeColor),
                     btn("pull", () => { action = "pull"; }, hackColor),
                     btn("puzzles", () => { action = "puzzles"; }, hackColor),
                     btn("restart coord", () => { action = "restart"; }, hackColor),
