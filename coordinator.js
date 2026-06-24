@@ -85,6 +85,7 @@ export async function main(ns) {
         digWindowStart: {}, // server -> money% at the start of its current "being worked" window
         digWindowLoops: {}, // server -> consecutive loops worked without resetting the window
         shortfallLoops: 0,  // consecutive loops harvest hack placement fell materially short
+        incomePeak: 0,      // decaying recent income peak (for shortfall severity gating)
         lastAlerts: {},     // finding code -> loopNum last toasted (debounce)
     };
     let loopNum = 0;
@@ -366,13 +367,15 @@ export async function main(ns) {
             const findings = [];   // { sev: "HIGH"|"WARN"|"INFO", code, msg }
 
             // (A) PLACEMENT_SHORTFALL -- coord wanted harvest hack threads but couldn't place them.
-            // Signature of: pool consumed by non-coord scripts, fragmentation, or a placement regression.
-            // BUT: share (sh.js) legitimately consumes the pool by design when you're rep-grinding, so a
-            // hack shortfall while share is running is EXPECTED, not a bug -- it's the tradeoff you chose.
-            // We only escalate to HIGH when the shortfall is NOT explained by share (the real-leak case:
-            // the overnight bug where share ballooned and harvest starved). Concretely: HIGH only if even
-            // AFTER accounting for share's threads, there still wouldn't be room for the wanted hack --
-            // i.e. share alone doesn't explain the gap. Otherwise WARN (visible, not alarming).
+            // The naive version cried wolf: share (sh.js) legitimately consumes the pool during a rep
+            // grind, so a hack shortfall is EXPECTED then, not a bug. But "share explains it" is the
+            // wrong discriminator -- in the overnight-leak disaster share WAS the consumer too (it
+            // ballooned and starved harvest). The true signal is INCOME: a shortfall while income is
+            // healthy is benign (chosen share pressure); a shortfall while income has COLLAPSED is the
+            // emergency. So we gate severity on income vs a rolling recent peak coord tracks itself.
+            let liveInc = 0;
+            try { liveInc = ns.getTotalScriptIncome()[0]; } catch (e) {}
+            health.incomePeak = Math.max((health.incomePeak || 0) * 0.97, liveInc);   // decaying peak
             let wantHack = 0, gotHack = 0;
             for (const t of harvest) {
                 wantHack += want[t].hack;
@@ -382,20 +385,22 @@ export async function main(ns) {
                 health.shortfallLoops++;
                 if (health.shortfallLoops >= 2) {
                     const missing = wantHack - gotHack;
-                    // does share explain the gap? share-explained if share accounts for most (>=80%)
-                    // of the missing hack -- the small remainder is normal prep/dig contention and
-                    // fragmentation, not a leak. Requiring share to cover 100% was too strict (a 484
-                    // gap with 400 share is clearly share-dominated, not a non-share leak).
-                    const shareExplains = shareThreads >= 0.8 * missing;
-                    if (shareExplains) {
+                    const pct = Math.round(100 * gotHack / wantHack);
+                    // income collapsed relative to recent peak? then the shortfall is REAL (harvest is
+                    // actually being starved, like the overnight bug). If income is near its peak, the
+                    // shortfall is benign -- harvest is earning fine, hack just isn't at its theoretical
+                    // max because share+prep+digs share the pool. Healthy = within 50% of recent peak.
+                    const incomeHealthy = health.incomePeak > 0 && liveInc >= 0.5 * health.incomePeak;
+                    if (incomeHealthy) {
                         findings.push({ sev: "WARN", code: "PLACEMENT_SHORTFALL",
-                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + Math.round(100 * gotHack / wantHack) +
-                                 "%); " + missing + " unplaced, explained by share (" + shareThreads + "t). Expected under share pressure -- kill share to reclaim, or accept for the rep grind." });
+                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + pct + "%); " + missing +
+                                 " unplaced, but income healthy ($" + fmtMoney(liveInc) + "/s). Expected under share (" +
+                                 shareThreads + "t) + prep/dig pool pressure -- not a problem." });
                     } else {
                         findings.push({ sev: "HIGH", code: "PLACEMENT_SHORTFALL",
-                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + Math.round(100 * gotHack / wantHack) +
-                                 "%) for " + health.shortfallLoops + " loops; " + missing + " unplaced, NOT explained by share (" +
-                                 shareThreads + "t) -- a non-share consumer ate the pool or placement is failing." });
+                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + pct + "%) for " + health.shortfallLoops +
+                                 " loops AND income collapsed ($" + fmtMoney(liveInc) + "/s vs peak $" + fmtMoney(health.incomePeak) +
+                                 "/s) -- harvest is being starved (share " + shareThreads + "t too big? non-share leak?)." });
                     }
                 }
             } else {
@@ -436,11 +441,25 @@ export async function main(ns) {
                     health.digWindowStart[t] = pct;
                     health.digWindowLoops[t] = 0;
                 } else if (health.digWindowLoops[t] >= 15) {
-                    // worked 15 loops, <5pp progress -> genuinely stuck (threads in, no money out)
+                    // worked 15 loops, <5pp progress. Report the REAL signal instead of guessing:
+                    //  - security phase: at-min => prep is in GROW mode, grow too slow to move money
+                    //    (cap too small for this server's grow need). Elevated => prep is in WEAKEN mode,
+                    //    weaken too slow to cut security (cap too small for the weaken need).
+                    //  - whether the per-dig cap is the binding constraint: if placed ~= perDigCap, the
+                    //    server is getting all the cap allows and still stalling => POOL-LIMITED (will
+                    //    self-resolve as the pool grows and perDigCap rises). If placed < perDigCap,
+                    //    something else is capping it (contention) -- worth a closer look.
+                    const secExcess = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
+                    const phase = secExcess > 1 ? ("weaken-limited (sec +" + secExcess.toFixed(1) + ")")
+                                                : "grow-limited (sec at min)";
+                    const capBound = placed >= 0.9 * perDigCap;
+                    const constraint = capBound
+                        ? "pool-limited: getting full cap " + perDigCap + "t but it's too small for this server at pool " + totalCap + "t -- clears as pool grows"
+                        : "placed " + placed + " < cap " + perDigCap + ": contention is capping it below its allowance -- check pool pressure";
                     findings.push({ sev: "WARN", code: "DIG_BLACKHOLE",
-                        msg: t + " worked " + health.digWindowLoops[t] + " loops with " + placed +
-                             " prep threads but money only " + (health.digWindowStart[t] * 100).toFixed(0) +
-                             "% -> " + (pct * 100).toFixed(0) + "% -- threads not converting (prep weaken/grow order?)" });
+                        msg: t + " stalled " + health.digWindowLoops[t] + " loops at " +
+                             (health.digWindowStart[t] * 100).toFixed(0) + "%->" + (pct * 100).toFixed(0) + "% money; " +
+                             phase + "; " + constraint });
                 }
             }
             // drop state for servers no longer digging or now prepped
@@ -659,4 +678,15 @@ function quantize(x) {
 function scoreServer(ns, t) {
     return effScore(ns.getServerMaxMoney(t), ns.getServerRequiredHackingLevel(t),
                     ns.getServerMinSecurityLevel(t), ns.getHackingLevel());
+}
+
+// compact money formatter for diagnostic messages
+function fmtMoney(n) {
+    if (!isFinite(n)) return "--";
+    const a = Math.abs(n);
+    if (a >= 1e12) return (n / 1e12).toFixed(2) + "t";
+    if (a >= 1e9)  return (n / 1e9).toFixed(2)  + "b";
+    if (a >= 1e6)  return (n / 1e6).toFixed(2)  + "m";
+    if (a >= 1e3)  return (n / 1e3).toFixed(1)  + "k";
+    return n.toFixed(0);
 }
