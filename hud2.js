@@ -22,26 +22,30 @@ export async function main(ns) {
         const ownedSet  = new Set(queued);
         const factions  = me.factions;
 
-        // NFG level: count installed copies; queued = pending install.
-        // NOTE: the fork stores NFG instances as "NeuroFlux Governor - Level N" (with the level
-        // suffix), not as bare "NeuroFlux Governor". Exact-match misses them all; substring match
-        // catches every NFG instance regardless of whether the suffix is present.
-        let nfgInstalled = 0, nfgQueued = 0;
-        for (const a of installed) if (a.startsWith(NFG)) nfgInstalled++;
-        for (const a of queued)    if (a.startsWith(NFG)) nfgQueued++;
-        const nfgPending = nfgQueued - nfgInstalled;
-
-        // next NFG cost/rep -- cheapest across joined factions offering it
-        let nfgNextRep = Infinity, nfgNextCost = Infinity;
+        // NFG "level" is NOT countable from getOwnedAugmentations -- the fork (like vanilla)
+        // stores stacked NFGs as one array entry and tracks level in a separate field.
+        // Back-calculate level from the next-NFG rep requirement, which follows the formula
+        //   nextRepReq = 500 * 1.14^currentLevel
+        // Solving for level: currentLevel = log(nextRepReq / 500) / log(1.14).
+        // This count INCLUDES queued NFGs (since each purchase bumps the next req), so
+        // pre-install it shows installed+queued total; post-install it shows installed only.
+        let nfgLevel = 0;
+        let nfgNextRep = null, nfgNextCost = null;
         for (const fac of factions) {
             try {
                 const augs = S.getAugmentationsFromFaction(fac);
                 if (augs.includes(NFG)) {
                     const r = S.getAugmentationRepReq(NFG);
                     const c = S.getAugmentationPrice(NFG);
-                    if (c < nfgNextCost) { nfgNextCost = c; nfgNextRep = r; }
+                    if (nfgNextCost === null || c < nfgNextCost) {
+                        nfgNextCost = c;
+                        nfgNextRep = r;
+                    }
                 }
             } catch (e) {}
+        }
+        if (nfgNextRep !== null && nfgNextRep > 0) {
+            nfgLevel = Math.max(0, Math.round(Math.log(nfgNextRep / 500) / Math.log(1.14)));
         }
 
         // per-faction: rep + favor + augs-remaining count + per-aug detail (for the snapshot file).
@@ -78,12 +82,11 @@ export async function main(ns) {
         try {
             const data = {
                 ts: Date.now(),
-                installed: installed.slice().sort(),   // full installed list (NFG appears N times if stacked)
+                installed: installed.slice().sort(),   // full installed list (NFG appears once regardless of level)
                 nfg: {
-                    installed: nfgInstalled,
-                    queued: nfgPending,
-                    nextRep: isFinite(nfgNextRep) ? nfgNextRep : null,
-                    nextCost: isFinite(nfgNextCost) ? nfgNextCost : null,
+                    level: nfgLevel,                   // derived from rep req formula, not array count
+                    nextRep: nfgNextRep,
+                    nextCost: nfgNextCost,
                 },
                 factions: facDetail,
             };
@@ -114,13 +117,13 @@ export async function main(ns) {
             panel("NEUROFLUX",
                 h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13 } },
                     h("span", null, "level"),
-                    h("span", { style: { color: hackColor, fontWeight: 700 } },
-                        "L" + nfgInstalled + (nfgPending > 0 ? ("  (+" + nfgPending + " queued)") : "")
-                    )
+                    h("span", { style: { color: hackColor, fontWeight: 700 } }, "L" + nfgLevel)
                 ),
                 h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 11, color: muted, marginTop: 2 } },
                     h("span", null, "next req"),
-                    h("span", null, "rep " + fmt(nfgNextRep) + "   $" + fmt(nfgNextCost))
+                    h("span", null,
+                        nfgNextRep !== null ? ("rep " + fmt(nfgNextRep) + "   $" + fmt(nfgNextCost)) : "(no faction offering)"
+                    )
                 )
             ),
             panel("FACTIONS",
