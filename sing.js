@@ -30,7 +30,13 @@ export async function main(ns) {
     const ENABLE_CRIME     = true;        // commit crime when cash < CASH_FLOOR
 
     const CASH_RESERVE = 1_000_000;   // never let cash drop below this from purchases
-    const CASH_FLOOR   = 500_000;   // crime when cash below this; faction work above
+    const CASH_FLOOR   = 500_000;     // crime when cash below this; faction work above.
+                                       // LOWERED from $5M: crime is useful only for the cold-start
+                                       // bootstrap (post-install, no income). Once coord earns >$500/s,
+                                       // faction work outperforms crime because (a) rep grind is the
+                                       // bottlenecking resource for the next install batch, and (b)
+                                       // hacking work gives XP too. Crime at low combat stats is slow,
+                                       // and combat stats don't serve the hacker-faction path.
     const FOCUS        = true;        // true = 2x rep rate, blocks manual UI activity
     const LOOP_MS      = 5000;        // seconds between loop iterations
 
@@ -76,13 +82,17 @@ export async function main(ns) {
     const BACKDOOR_TARGETS = ["CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z", "The-Cave", "fulcrumassets"];
 
     // port openers, cheapest first -- buy in this order so we don't blow cash on
-    // SQLInject and skip the cheaper ones
+    // SQLInject and skip the cheaper ones. Each program can have a `minLevel` gate:
+    // if player level is below it, sing skips the buy. Default minLevel=0 means
+    // "always buy when affordable". SQLInject gated at L800 because the 5-port
+    // servers it unlocks all require hacking 900+ -- buying it earlier is just
+    // a $250M tax on disposable RAM (programs reset on install).
     const PROGRAMS = [
-        { name: "BruteSSH.exe",  cost: 500_000 },
-        { name: "FTPCrack.exe",  cost: 1_500_000 },
-        { name: "relaySMTP.exe", cost: 5_000_000 },
-        { name: "HTTPWorm.exe",  cost: 30_000_000 },
-        { name: "SQLInject.exe", cost: 250_000_000 },
+        { name: "BruteSSH.exe",  cost: 500_000,     minLevel: 0 },
+        { name: "FTPCrack.exe",  cost: 1_500_000,   minLevel: 0 },
+        { name: "relaySMTP.exe", cost: 5_000_000,   minLevel: 0 },
+        { name: "HTTPWorm.exe",  cost: 30_000_000,  minLevel: 0 },
+        { name: "SQLInject.exe", cost: 250_000_000, minLevel: 800 },
     ];
 
     ns.disableLog("ALL");
@@ -121,9 +131,13 @@ export async function main(ns) {
                 if (!torOk) log("  TOR not yet purchased (need $200k)");
                 for (const prog of PROGRAMS) {
                     if (ns.fileExists(prog.name, "home")) continue;
+                    if (prog.minLevel && lvl < prog.minLevel) {
+                        log("  skip " + prog.name + ": L" + lvl + " < L" + prog.minLevel + " (server reqs too high to use)");
+                        continue;   // don't break -- a level-gated program shouldn't block subsequent ones
+                    }
                     if (cash - prog.cost < CASH_RESERVE) {
                         log("  " + prog.name + ": $" + fmt(prog.cost) + " needed, waiting on cash");
-                        break;   // cheaper ones already owned (filtered above); pricier won't help
+                        break;   // cash-gated; cheaper ones already owned, pricier won't be cheaper
                     }
                     const bought = ns.singularity.purchaseProgram(prog.name);
                     if (bought) log("  bought " + prog.name + " for $" + fmt(prog.cost));
