@@ -21,16 +21,36 @@ export async function main(ns) {
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
-    const DIG_TARGETS_ARG = ns.args[2] !== undefined ? Number(ns.args[2]) : 0;   // 0/omitted = AUTO: digCount scales
-                                 // with the pool (computed in-loop), so prep parallelism grows as the rebuild does.
-                                 // PREP THROUGHPUT: how many cold servers prep in parallel. Pass an explicit 3rd arg
-                                 // to override the auto value with a fixed count.
-    const DIG_PREP_CAP = 40000;  // flat ceiling on prep threads per dig target. A server's prep need is set by
-                                 // its OWN economics, not the pool size -- 4% of a 270k pool was still 11k, far
-                                 // more than any BN1 server needs at min security. growthAnalyze (no Formulas)
-                                 // over-counts grow threads at high security, so prepCost balloons on a cold
-                                 // target; this bounds it. prep.js weakens-then-grows over a few cycles, so a
-                                 // bounded crew preps fully anyway. Raise if big servers prep slowly; lower to cut idle.
+    const DIG_SLOTS_ARG = ns.args[2] !== undefined ? Number(ns.args[2]) : 0;   // 0/omitted = AUTO.
+                                 // Pool-relative dig selection (below) auto-sizes parallel digs from the live
+                                 // pool; an explicit 3rd arg overrides DIG_MAX_SLOTS (the parallel-dig ceiling).
+                                 // `run coordinator.js <numTargets> <levelRatio> <digMaxSlots> <batchMax>`.
+    // --- POOL-RELATIVE DIG ALLOCATION (replaces the old absolute DIG_PREP_CAP) -----------------
+    // The recurring coord-scaling problem: dig logic reasoned in ABSOLUTE thread counts (a 40000-
+    // thread cap, "~10k threads per dig"), but what matters is the RATIO of a server's prep cost to
+    // the live pool. 40k threads is trivial at a 200k pool (BN1 endgame) and catastrophic at a 2.4k
+    // pool (BN4 mid-game) -- same number, opposite meaning -- so the absolute constants broke at
+    // every band boundary and got re-patched. These ratio-based knobs self-adjust at any pool size:
+    const DIG_POOL_FRAC   = 0.10;   // no single dig may claim more than this fraction of the pool.
+                                    // Replaces DIG_PREP_CAP. At 2.4k pool -> 240 thread cap; at 200k
+                                    // pool -> 20k cap. Same rule, scales itself. Stops one fat cold
+                                    // server from swallowing the pool. NOTE kept well below
+                                    // DIG_BUDGET_FRAC so budget/perDig allows several parallel digs
+                                    // (at 0.25 the ratio capped parallelism at ~2 -- too few).
+    const DIG_BUDGET_FRAC = 0.50;   // max fraction of the pool spent on digs in total each loop. The
+                                    // rest is reserved for HARVEST (current income). Digs are an
+                                    // investment in future income; they must not starve present income.
+    const DIG_AFFORD_LOOPS = 3;     // a server is dig-eligible only if its prep cost can be covered by
+                                    // the dig budget within this many loops (prepCost <= digBudget *
+                                    // this). A server too expensive to prep with the current pool is
+                                    // DEFERRED -- digging it just pours the pool into a prep that never
+                                    // finishes. As the pool grows, the inequality flips and the server
+                                    // becomes eligible on its own. This is the gate that was missing:
+                                    // it's what makes megacorps (req 1000+, vast prep need) wait until
+                                    // the pool is big enough instead of black-holing it at mid-game.
+    const DIG_MIN_SLOTS   = 3;      // always allow at least this many parallel digs even if the budget
+                                    // math would allow fewer, so the pipeline never fully stalls.
+    const DIG_MAX_SLOTS_DEFAULT = 24;   // hard ceiling on parallel digs (prevents over-fragmentation).
     const ENTER = 0.90, EXIT = 0.60;   // hysteresis: prepped at >=90% money, reverts only below 60%
     const LOOP_MS = 15000;
     const PREP = "prep.js", HACK = "h.js";
@@ -58,8 +78,21 @@ export async function main(ns) {
 
     const preppedSet = new Set();   // persists across loops (hysteresis state)
     let lastKey = "";               // last harvest set logged (for change-only logging, not gating)
+    // --- self-diagnostics state (persists across loops) ----------------------------------------
+    // No external test harness exists for in-game scripts, so coord checks its own plan-vs-reality
+    // invariants each loop and emits findings. Catches the bug classes hit in development: pool
+    // consumed by non-coord scripts (harvest can't place), fat servers that never finish prepping
+    // (dig black-holes), and planner overruns. Findings go to coord-health.txt (hud1 surfaces them
+    // in the snapshot) and HIGH-severity ones toast in real time (debounced).
+    const health = {
+        digLoops: {},       // server -> consecutive loops it's been actively digging
+        shortfallLoops: 0,  // consecutive loops harvest hack placement fell materially short
+        lastAlerts: {},     // finding code -> loopNum last toasted (debounce)
+    };
+    let loopNum = 0;
 
     while (true) {
+        loopNum++;
         try {
             // --- scan ---
             const seen = new Set(["home"]), queue = ["home"], all = [];
@@ -146,7 +179,8 @@ export async function main(ns) {
             const bestMoney = harvest.length ? Math.max(...harvest.map(t => ns.getServerMaxMoney(t))) : 0;
             harvest = harvest.filter(t => ns.getServerMaxMoney(t) >= VALUE_FLOOR * bestMoney)
                              .slice(0, numTargets + STICKY_EXTRA);
-            // pool capacity (threads) -- computed here so digCount can scale prep parallelism to the live pool.
+            const harvestSet = new Set(harvest);   // O(1) membership for the dig-prep placement pass
+            // pool capacity (threads) -- the live worker pool size. Everything dig-related scales off this.
             const workerRam = Math.max(ns.getScriptRam(PREP, "home"), ns.getScriptRam(HACK, "home")) || 1.75;
             let totalCap = 0;
             for (const h of all.concat("home")) {
@@ -155,47 +189,68 @@ export async function main(ns) {
                 if (h === "home") cap -= HOME_RESERVE;
                 totalCap += Math.max(0, Math.floor(cap / workerRam));
             }
-            // auto dig parallelism: scale with the pool, clamped [6,20]. Bigger pool -> prep more cold servers at
-            // once -> faster rebuild. ~10k threads budgeted per dig (covers a megacorp's cold need). Arg overrides.
-            const digCount = DIG_TARGETS_ARG > 0 ? DIG_TARGETS_ARG : Math.max(6, Math.min(20, Math.floor(totalCap / 10000)));
-            // dig list: the cold servers we actively prep THIS cycle, in parallel, each capped to its
-            // own need (pass 3 below). Capping + parallelism replaces "pour the whole pool into one
-            // focus" -- at a 100k+ thread pool that wasted nearly all of it on a server needing a few hundred.
-            //  - no earners yet: bootstrap the FASTEST-to-prep servers first (income in seconds)
-            //  - once earning: dig the highest-POTENTIAL unprepped top-N targets (big servers now included)
-            let digList;
+
+            // ---- POOL-RELATIVE DIG SELECTION --------------------------------------------------
+            // All thresholds are fractions of the live pool, so the same logic holds whether the
+            // pool is 2.4k threads (BN4 mid-game) or 2M (BN1 endgame). Three rules:
+            //   (1) per-dig cap     = DIG_POOL_FRAC * pool  -- no one server monopolizes the pool
+            //   (2) affordability   = prepCost <= digBudget * DIG_AFFORD_LOOPS -- defer servers too
+            //                         expensive to prep with the current pool (they'd black-hole it)
+            //   (3) total dig spend <= DIG_BUDGET_FRAC * pool -- digs never starve harvest income
+            // Ordering is PRODUCTIVE-FIRST: fast/cheap-to-prep high-score servers claim budget before
+            // speculative fat servers. Income flows now; fat servers prep on leftover capacity and
+            // become eligible naturally as the pool grows (rule 2 flips on its own -- no band logic).
+            const perDigCap = Math.max(1, Math.floor(totalCap * DIG_POOL_FRAC));
+            const digBudgetTotal = Math.max(1, Math.floor(totalCap * DIG_BUDGET_FRAC));
+            const affordCeil = digBudgetTotal * DIG_AFFORD_LOOPS;   // max prepCost a dig may have to be eligible
+            const DIG_MAX_SLOTS = DIG_SLOTS_ARG > 0 ? DIG_SLOTS_ARG : DIG_MAX_SLOTS_DEFAULT;
+
+            // candidate cold servers, each with its (uncapped) prep need and score.
+            // Source from rootedMoney (reqLevel <= L) so prep can target fat servers in the 0.9L..L
+            // band that the harvest ratio-filter excludes -- prep/grow/weaken aren't level-gated.
+            const digCands = rootedMoney
+                .filter(t => !preppedSet.has(t) && !batchSetS.has(t))
+                .map(t => ({
+                    t,
+                    need: Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN)),
+                    score: scoreOf[t] || 0,
+                    money: ns.getServerMaxMoney(t),
+                }));
+
+            // PRODUCTIVE-FIRST ordering: by score descending (the digrank order). A fat server with a
+            // high max-money but low per-thread score sorts BELOW an efficient mid-tier server, which
+            // is exactly what we want -- mid-tier income first, fat servers as the pool allows.
+            // COLD START exception: when nothing is prepped yet (no income at all), order by prep-cost
+            // ASCENDING instead -- get *some* server earning in seconds, rather than committing the
+            // whole small pool to the highest-score server which may be slow to prep. Once any earner
+            // exists, switch to score-order so the pipeline fills with the most valuable targets.
             if (harvest.length === 0) {
-                digList = eligible.filter(t => !preppedSet.has(t))
-                    .sort((a, b) => prepCost(ns, a) - prepCost(ns, b))
-                    .slice(0, digCount);
+                digCands.sort((a, b) => (a.need - b.need) || (a.t < b.t ? -1 : 1));
             } else {
-                // byScore-ranked digs (favors small efficient servers -- fast income rebuild)
-                const scoreDigs = top.filter(t => !preppedSet.has(t));
-                // FAT-PREP RESERVATION: byScore starves the fat $1b+ servers (high req level = poor
-                // per-thread efficiency), so they never prep and never become batch-eligible -- batchers
-                // stay at 0 forever. Reserve up to BATCH_MAX dig slots for the fattest unprepped servers
-                // above BATCH_FLOOR, ranked by MAX MONEY, so the future batch targets actually get prepped.
-                // These interleave with the byScore digs rather than replacing them.
-                // SOURCED FROM rootedMoney (reqLevel <= L), NOT eligible (reqLevel <= 0.9*L): the ratio
-                // filter excludes fat servers in the 0.9L..L band (e.g. at L199 it cuts everything needing
-                // 180-199), which is exactly the fat cluster we need to prep. Prep (grow/weaken) works at
-                // any level; only hacking is level-gated, and rootedMoney already excludes servers above L.
-                const fatUnprepped = BATCH_MAX > 0
-                    ? rootedMoney.filter(t => !preppedSet.has(t) && ns.getServerMaxMoney(t) >= BATCH_FLOOR)
-                              .sort((a, b) => ns.getServerMaxMoney(b) - ns.getServerMaxMoney(a))
-                              .slice(0, BATCH_MAX)
-                    : [];
-                // merge: fat servers first (priority prep), then byScore digs, dedup, cap at digCount.
-                // Fat-first ensures the batch pipeline fills even when digCount is small.
-                const merged = [];
-                const seen = new Set();
-                for (const t of fatUnprepped) { if (!seen.has(t)) { seen.add(t); merged.push(t); } }
-                for (const t of scoreDigs)    { if (!seen.has(t)) { seen.add(t); merged.push(t); } }
-                digList = merged.slice(0, digCount);
+                digCands.sort((a, b) => (b.score - a.score) || (a.t < b.t ? -1 : 1));
+            }
+
+            // Greedily admit digs in productive order, subject to all three rules. A server that fails
+            // the affordability gate is DEFERRED (logged, not dropped) -- it'll qualify once the pool
+            // grows. Cap each admitted dig's prep at perDigCap; stop when the running budget is spent.
+            let digList = [];
+            const digPlan = {};        // t -> capped prep threads to request this loop
+            const digDeferred = [];    // t's skipped this loop because too expensive for current pool
+            let digSpend = 0;
+            for (const c of digCands) {
+                if (digList.length >= DIG_MAX_SLOTS) break;
+                // affordability gate (rule 2): too expensive to prep with the pool soon? defer it.
+                // (Always allow the cheapest DIG_MIN_SLOTS through even if pricey, so the pipeline
+                //  never fully stalls on a fleet where everything left is expensive.)
+                if (c.need > affordCeil && digList.length >= DIG_MIN_SLOTS) { digDeferred.push(c.t); continue; }
+                const capped = Math.min(c.need, perDigCap);                  // rule 1: per-dig cap
+                if (digSpend + capped > digBudgetTotal && digList.length >= DIG_MIN_SLOTS) break;  // rule 3
+                digList.push(c.t);
+                digPlan[c.t] = capped;
+                digSpend += capped;
             }
 
             // --- desired plan: per-target thread targets (harvest = hack+prep crew; digs = capped prep) ---
-            // (workerRam + totalCap computed above for digCount; reused here for the hack cap)
             const HACK_CAP = Math.max(1, Math.floor(totalCap * 0.20));   // no single target hogs >20% on hack
             const crews = {};
             for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
@@ -203,8 +258,7 @@ export async function main(ns) {
             for (const t of harvest) want[t] = { hack: crews[t].hackT, prep: crews[t].prepT };
             for (const t of digList) {
                 if (want[t]) continue;                              // harvest wins if somehow both
-                const raw = Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN));
-                want[t] = { hack: 0, prep: Math.min(raw, DIG_PREP_CAP) };   // digs: capped prep, no seed-hack
+                want[t] = { hack: 0, prep: digPlan[t] };            // digs: pool-capped prep, no seed-hack
             }
 
             // --- what's actually running now, grouped by target + script ---
@@ -264,13 +318,111 @@ export async function main(ns) {
                 if (have === 0 && w > 0) return true;
                 return (w - have) > Math.max(3, Math.ceil(w * 0.10));
             };
+            // PLACEMENT PRIORITY (pool is consumed in this order):
+            //   1. harvest hack  -- current income, highest priority
+            //   2. harvest prep  -- maintains current earners (keeps them prepped)
+            //   3. dig prep      -- investment in future earners, gets only leftover capacity
+            // This ordering is what guarantees digs can't starve harvest: by the time dig prep is
+            // placed, harvest's full crew is already claimed. Combined with the dig BUDGET cap, digs
+            // are doubly bounded (budget-limited in planning, leftover-limited in placement).
+            // placed{Hack,Prep} accumulate what place() ACTUALLY deployed, for the diagnostics below.
+            const placedHack = {}, placedPrep = {};
             for (const t of harvest) {
                 const r = remain[t] || { hack: 0, prep: 0 };
-                if (worth(want[t].hack, r.hack)) place(ns, pool, HACK, want[t].hack - r.hack, t);
+                if (worth(want[t].hack, r.hack)) placedHack[t] = place(ns, pool, HACK, want[t].hack - r.hack, t);
             }
-            for (const t of Object.keys(want)) {
+            for (const t of harvest) {
                 const r = remain[t] || { hack: 0, prep: 0 };
-                if (worth(want[t].prep, r.prep)) place(ns, pool, PREP, want[t].prep - r.prep, t);
+                if (worth(want[t].prep, r.prep)) placedPrep[t] = place(ns, pool, PREP, want[t].prep - r.prep, t);
+            }
+            for (const t of digList) {
+                if (harvestSet.has(t)) continue;                    // already handled as harvest above
+                const r = remain[t] || { hack: 0, prep: 0 };
+                if (worth(want[t].prep, r.prep)) placedPrep[t] = place(ns, pool, PREP, want[t].prep - r.prep, t);
+            }
+
+            // --- SELF-DIAGNOSTICS: check plan-vs-reality invariants ------------------------------
+            // Each check compares what coord INTENDED against what actually happened. We deliberately
+            // do NOT re-derive the plan (that would just reproduce any planning bug); we observe gaps.
+            const findings = [];   // { sev: "HIGH"|"WARN"|"INFO", code, msg }
+
+            // (A) PLACEMENT_SHORTFALL -- coord wanted harvest hack threads but couldn't place them.
+            // Signature of: pool consumed by non-coord scripts (the overnight sharecap bug), or
+            // fragmentation, or a placement/deadband regression. Needs 2 consecutive loops to fire
+            // (one-loop dips during reconcile are normal).
+            let wantHack = 0, gotHack = 0;
+            for (const t of harvest) {
+                wantHack += want[t].hack;
+                gotHack += (remain[t] ? remain[t].hack : 0) + (placedHack[t] || 0);
+            }
+            if (wantHack >= 50 && gotHack < 0.5 * wantHack) {
+                health.shortfallLoops++;
+                if (health.shortfallLoops >= 2) {
+                    findings.push({ sev: "HIGH", code: "PLACEMENT_SHORTFALL",
+                        msg: "harvest hack wanted " + wantHack + ", placed " + gotHack + " (" +
+                             Math.round(100 * gotHack / wantHack) + "%) for " + health.shortfallLoops +
+                             " loops -- pool likely eaten by non-coord scripts (share?) or fragmented" });
+                }
+            } else {
+                health.shortfallLoops = 0;
+            }
+
+            // (B) DIG_BLACKHOLE -- a server has been digging many loops without converging to prepped.
+            // Signature of: a server too fat to prep with the current pool (the fat-server starvation
+            // bug). The pool-relative affordability gate should prevent this, so firing here means the
+            // gate is mistuned or a server is pathological. Reports money% so you can see (non)progress.
+            const digSetNow = new Set(digList);
+            for (const t of digList) {
+                health.digLoops[t] = (health.digLoops[t] || 0) + 1;
+                const maxM = ns.getServerMaxMoney(t) || 1;
+                const pct = ns.getServerMoneyAvailable(t) / maxM;
+                if (health.digLoops[t] >= 20 && pct < ENTER) {
+                    findings.push({ sev: "WARN", code: "DIG_BLACKHOLE",
+                        msg: t + " digging " + health.digLoops[t] + " loops, still " +
+                             (pct * 100).toFixed(0) + "% money -- not converging; too fat for pool " +
+                             totalCap + "t (need " + Math.ceil(prepCost(ns, t) * PREP_MARGIN) + ", cap " + perDigCap + ")" });
+                }
+            }
+            // reset counters for servers that finished prepping or dropped out of the dig list
+            for (const t of Object.keys(health.digLoops)) {
+                if (!digSetNow.has(t) || preppedSet.has(t)) delete health.digLoops[t];
+            }
+
+            // (C) DIG_BUDGET_OVERRUN -- planner self-check: dig prep requested must not exceed the
+            // dig budget. Verifies the new pool-relative planner; should never fire if it's correct.
+            let digPrepReq = 0;
+            for (const t of digList) digPrepReq += digPlan[t] || 0;
+            if (digPrepReq > digBudgetTotal * 1.05) {
+                findings.push({ sev: "WARN", code: "DIG_BUDGET_OVERRUN",
+                    msg: "dig prep requested " + digPrepReq + " exceeds budget " + digBudgetTotal + " -- planner bug" });
+            }
+
+            // (D) POOL split (INFO, always) -- how the theoretical capacity is actually used. The
+            // 'other' bucket is non-coord consumption (share/sing/hud/etc.); a surprising spike there
+            // is the early warning the overnight run lacked.
+            const idleNow = pool.reduce((s, r) => s + r.free, 0);
+            let coordThreads = 0;
+            for (const t of new Set([...harvest, ...digList])) {
+                const r = remain[t] || { hack: 0, prep: 0 };
+                coordThreads += r.hack + r.prep + (placedHack[t] || 0) + (placedPrep[t] || 0);
+            }
+            const otherThreads = Math.max(0, totalCap - coordThreads - idleNow);
+            findings.push({ sev: "INFO", code: "POOL",
+                msg: "cap " + totalCap + "t = coord " + coordThreads + " + idle " + idleNow +
+                     " + other " + otherThreads + " (" + Math.round(100 * otherThreads / Math.max(1, totalCap)) + "% non-coord)" });
+
+            // write health file for hud1's snapshot to surface; toast HIGH findings (debounced).
+            try {
+                ns.write("coord-health.txt", JSON.stringify({ ts: Date.now(), loop: loopNum, L, findings }), "w");
+            } catch (e) {}
+            for (const f of findings) {
+                if (f.sev !== "HIGH") continue;
+                const last = health.lastAlerts[f.code];
+                if (last === undefined || (loopNum - last) >= 4) {   // re-alert at most every 4 loops
+                    ns.toast("coord: " + f.msg, "warning", 6000);
+                    ns.tprint("[coord HIGH] " + f.code + ": " + f.msg);
+                    health.lastAlerts[f.code] = loopNum;
+                }
             }
 
             // --- batch controllers: ensure one bbatch2 per batch target; drop stale ones. The reconcile
@@ -294,8 +446,9 @@ export async function main(ns) {
                 const crewStr = harvest.map(t => t + "(h" + want[t].hack + "/p" + want[t].prep + ")").join(" ");
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
                     + (batchSet.length ? "  batch[" + batchSet.length + "] " + batchSet.join(",") : "")
-                    + "  dig[" + digList.length + "] " + (digList.join(",") || "(none)")
-                    + "  cap " + totalCap + "t  idle " + idle + "t");
+                    + "  dig[" + digList.length + "] " + (digList.map(t => t + "(p" + (digPlan[t] || 0) + ")").join(",") || "(none)")
+                    + (digDeferred.length ? "  deferred[" + digDeferred.length + "] " + digDeferred.slice(0, 5).join(",") + (digDeferred.length > 5 ? "..." : "") : "")
+                    + "  cap " + totalCap + "t (perDig " + perDigCap + " / digBudget " + digBudgetTotal + ")  idle " + idle + "t");
             }
 
             // --- PHASE 2: XP fill. Run AFTER harvest/dig/batch placement so it consumes only true leftovers.
@@ -350,14 +503,15 @@ export async function main(ns) {
 }
 
 function place(ns, pool, script, threads, target) {
-    let remaining = threads;
+    let remaining = threads, done = 0;
     for (const r of pool) {
         if (remaining <= 0) break;
         if (r.free <= 0) continue;
         const n = Math.min(r.free, remaining);
         const pid = ns.exec(script, r.host, n, target);
-        if (pid !== 0) { r.free -= n; remaining -= n; }
+        if (pid !== 0) { r.free -= n; remaining -= n; done += n; }
     }
+    return done;   // actual threads deployed (may be < requested if the pool ran out)
 }
 
 // Kill whole worker processes for one (target, script) until the running thread count is at/under

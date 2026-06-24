@@ -428,6 +428,31 @@ export async function main(ns) {
                 }
             }
         }
+        // --- coord self-diagnostics (written by coordinator.js each loop) ---
+        lines.push("");
+        let healthRead = null;
+        try {
+            const raw = ns.read("coord-health.txt");
+            if (raw && raw.length > 0) healthRead = JSON.parse(raw);
+        } catch (e) {}
+        if (!healthRead) {
+            lines.push("COORD HEALTH: (no coord-health.txt -- coord not running the diagnostics build?)");
+        } else {
+            const hage = Date.now() - (healthRead.ts || 0);
+            if (hage > 60000) {
+                lines.push("COORD HEALTH: stale by " + Math.floor(hage / 1000) + "s (coord stopped?)");
+            } else {
+                const fs = healthRead.findings || [];
+                const highs = fs.filter(f => f.sev === "HIGH");
+                const warns = fs.filter(f => f.sev === "WARN");
+                const infos = fs.filter(f => f.sev === "INFO");
+                lines.push("COORD HEALTH (loop " + (healthRead.loop || "?") + "): " +
+                    highs.length + " HIGH, " + warns.length + " WARN");
+                for (const f of highs) lines.push("  [HIGH] " + f.code + ": " + f.msg);
+                for (const f of warns) lines.push("  [WARN] " + f.code + ": " + f.msg);
+                for (const f of infos) lines.push("  " + f.msg);
+            }
+        }
         statusText = lines.join("\n");
 
         // --- render ---
