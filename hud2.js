@@ -22,10 +22,13 @@ export async function main(ns) {
         const ownedSet  = new Set(queued);
         const factions  = me.factions;
 
-        // NFG level: count installed copies; queued = pending install
+        // NFG level: count installed copies; queued = pending install.
+        // NOTE: the fork stores NFG instances as "NeuroFlux Governor - Level N" (with the level
+        // suffix), not as bare "NeuroFlux Governor". Exact-match misses them all; substring match
+        // catches every NFG instance regardless of whether the suffix is present.
         let nfgInstalled = 0, nfgQueued = 0;
-        for (const a of installed) if (a === NFG) nfgInstalled++;
-        for (const a of queued)    if (a === NFG) nfgQueued++;
+        for (const a of installed) if (a.startsWith(NFG)) nfgInstalled++;
+        for (const a of queued)    if (a.startsWith(NFG)) nfgQueued++;
         const nfgPending = nfgQueued - nfgInstalled;
 
         // next NFG cost/rep -- cheapest across joined factions offering it
@@ -52,7 +55,7 @@ export async function main(ns) {
             try { favor = S.getFactionFavor(fac); } catch (e) {}
             let augs = [];
             try { augs = S.getAugmentationsFromFaction(fac); } catch (e) {}
-            const unowned = augs.filter(a => !ownedSet.has(a) && a !== NFG);
+            const unowned = augs.filter(a => !ownedSet.has(a) && !a.startsWith(NFG));
             facRows.push({ fac, rep, favor, left: unowned.length });
 
             // per-aug detail for snapshot file
