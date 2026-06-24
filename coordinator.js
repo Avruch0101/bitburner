@@ -239,13 +239,24 @@ export async function main(ns) {
             // the per-dig cap already stops any one server from monopolizing the pool; the budget
             // already protects harvest income. An earlier affordability gate here caused an inversion
             // (cheap high-score servers deferred while one expensive server dug) and is removed.
+            // The DIG_MIN_SLOTS floor guarantees at least that many digs get worked even on a small
+            // pool -- but it must NOT bust the budget: a forced min-slot dig gets the REMAINING budget,
+            // not the full per-dig cap (else 3 * perDigCap could exceed the budget, the cause of an
+            // observed DIG_BUDGET_OVERRUN after perDigCap was raised to 0.20).
             let digList = [];
             const digPlan = {};        // t -> capped prep threads to request this loop
             let digSpend = 0;
             for (const c of digCands) {
                 if (digList.length >= DIG_MAX_SLOTS) break;
-                const capped = Math.min(c.need, perDigCap);                  // per-dig cap (rule 1)
-                if (digSpend + capped > digBudgetTotal && digList.length >= DIG_MIN_SLOTS) break;  // budget (rule 3)
+                const remainingBudget = digBudgetTotal - digSpend;
+                if (remainingBudget <= 0) break;                             // budget fully spent
+                let capped = Math.min(c.need, perDigCap);                    // per-dig cap (rule 1)
+                if (digSpend + capped > digBudgetTotal) {
+                    // would exceed budget. If we already have the minimum slots, stop. Otherwise this
+                    // is a forced min-slot dig -- give it whatever budget remains (capped at its need).
+                    if (digList.length >= DIG_MIN_SLOTS) break;
+                    capped = Math.min(capped, remainingBudget);
+                }
                 digList.push(c.t);
                 digPlan[c.t] = capped;
                 digSpend += capped;
