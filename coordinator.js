@@ -31,12 +31,14 @@ export async function main(ns) {
     // the live pool. 40k threads is trivial at a 200k pool (BN1 endgame) and catastrophic at a 2.4k
     // pool (BN4 mid-game) -- same number, opposite meaning -- so the absolute constants broke at
     // every band boundary and got re-patched. These ratio-based knobs self-adjust at any pool size:
-    const DIG_POOL_FRAC   = 0.10;   // no single dig may claim more than this fraction of the pool.
-                                    // Replaces DIG_PREP_CAP. At 2.4k pool -> 240 thread cap; at 200k
-                                    // pool -> 20k cap. Same rule, scales itself. Stops one fat cold
-                                    // server from swallowing the pool. NOTE kept well below
-                                    // DIG_BUDGET_FRAC so budget/perDig allows several parallel digs
-                                    // (at 0.25 the ratio capped parallelism at ~2 -- too few).
+    const DIG_POOL_FRAC   = 0.20;   // no single dig may claim more than this fraction of the pool.
+                                    // Replaces DIG_PREP_CAP. At 1.7k pool -> 334 thread cap; at 200k
+                                    // pool -> 40k cap. Scales itself. Was 0.10, but that capped digs so
+                                    // low (166 at a 1.7k pool) that servers with large prep needs
+                                    // (5000+ threads) crawled at ~3%/loop and read as frozen (the
+                                    // DIG_BLACKHOLE warnings). 0.20 doubles per-dig throughput so fat
+                                    // servers actually converge, while still bounding any one dig to a
+                                    // fifth of the pool. Tune up if big servers still prep too slowly.
     const DIG_BUDGET_FRAC = 0.50;   // max fraction of the pool spent on digs in total each loop. The
                                     // rest is reserved for HARVEST (current income). Digs are an
                                     // investment in future income; they must not starve present income.
@@ -80,7 +82,8 @@ export async function main(ns) {
     // (dig black-holes), and planner overruns. Findings go to coord-health.txt (hud1 surfaces them
     // in the snapshot) and HIGH-severity ones toast in real time (debounced).
     const health = {
-        digLoops: {},       // server -> consecutive loops it's been actively digging
+        digWindowStart: {}, // server -> money% at the start of its current "being worked" window
+        digWindowLoops: {}, // server -> consecutive loops worked without resetting the window
         shortfallLoops: 0,  // consecutive loops harvest hack placement fell materially short
         lastAlerts: {},     // finding code -> loopNum last toasted (debounce)
     };
@@ -370,25 +373,53 @@ export async function main(ns) {
                 health.shortfallLoops = 0;
             }
 
-            // (B) DIG_BLACKHOLE -- a server has been digging many loops without converging to prepped.
-            // Signature of: a server too fat to prep with the current pool (the fat-server starvation
-            // bug). The pool-relative affordability gate should prevent this, so firing here means the
-            // gate is mistuned or a server is pathological. Reports money% so you can see (non)progress.
+            // (B) DIG_BLACKHOLE -- fire ONLY when a server is actually RECEIVING prep threads but its
+            // money% is not climbing. Three states, only one is a problem:
+            //   - STARVED: getting ~no prep threads (waiting behind harvest+share at a small pool).
+            //     This is BENIGN and EXPECTED -- harvest income has priority by design. No warning.
+            //   - PROGRESSING: getting threads, money% rising. Healthy. No warning.
+            //   - STUCK: getting threads for many loops, money% flat. The real pathology (threads not
+            //     converting -- e.g. prep growing against high security, or cap too low to outpace
+            //     decay). This is what warrants a warning.
+            // Progress is measured CUMULATIVELY over a window (not loop-to-loop) so slow-but-steady
+            // prep doesn't false-fire on per-loop rounding. "Being worked" = received >=50% of its
+            // requested (capped) prep this loop.
             const digSetNow = new Set(digList);
             for (const t of digList) {
-                health.digLoops[t] = (health.digLoops[t] || 0) + 1;
                 const maxM = ns.getServerMaxMoney(t) || 1;
                 const pct = ns.getServerMoneyAvailable(t) / maxM;
-                if (health.digLoops[t] >= 20 && pct < ENTER) {
+                const placed = (remain[t] ? remain[t].prep : 0) + (placedPrep[t] || 0);
+                const requested = digPlan[t] || 0;
+                const beingWorked = requested > 0 && placed >= 0.5 * requested;
+                if (!beingWorked) {
+                    // starved / waiting its turn -- benign, reset its window so it isn't blamed later
+                    delete health.digWindowStart[t];
+                    delete health.digWindowLoops[t];
+                    continue;
+                }
+                if (health.digWindowStart[t] === undefined) {
+                    health.digWindowStart[t] = pct;
+                    health.digWindowLoops[t] = 0;
+                }
+                health.digWindowLoops[t]++;
+                if (pct > health.digWindowStart[t] + 0.05) {
+                    // >=5 percentage-points cumulative progress -> healthy, reset the window
+                    health.digWindowStart[t] = pct;
+                    health.digWindowLoops[t] = 0;
+                } else if (health.digWindowLoops[t] >= 15) {
+                    // worked 15 loops, <5pp progress -> genuinely stuck (threads in, no money out)
                     findings.push({ sev: "WARN", code: "DIG_BLACKHOLE",
-                        msg: t + " digging " + health.digLoops[t] + " loops, still " +
-                             (pct * 100).toFixed(0) + "% money -- not converging; too fat for pool " +
-                             totalCap + "t (need " + Math.ceil(prepCost(ns, t) * PREP_MARGIN) + ", cap " + perDigCap + ")" });
+                        msg: t + " worked " + health.digWindowLoops[t] + " loops with " + placed +
+                             " prep threads but money only " + (health.digWindowStart[t] * 100).toFixed(0) +
+                             "% -> " + (pct * 100).toFixed(0) + "% -- threads not converting (prep weaken/grow order?)" });
                 }
             }
-            // reset counters for servers that finished prepping or dropped out of the dig list
-            for (const t of Object.keys(health.digLoops)) {
-                if (!digSetNow.has(t) || preppedSet.has(t)) delete health.digLoops[t];
+            // drop state for servers no longer digging or now prepped
+            for (const t of Object.keys(health.digWindowLoops)) {
+                if (!digSetNow.has(t) || preppedSet.has(t)) {
+                    delete health.digWindowLoops[t];
+                    delete health.digWindowStart[t];
+                }
             }
 
             // (C) DIG_BUDGET_OVERRUN -- planner self-check: dig prep requested must not exceed the
@@ -413,6 +444,19 @@ export async function main(ns) {
             findings.push({ sev: "INFO", code: "POOL",
                 msg: "cap " + totalCap + "t = coord " + coordThreads + " + idle " + idleNow +
                      " + other " + otherThreads + " (" + Math.round(100 * otherThreads / Math.max(1, totalCap)) + "% non-coord)" });
+
+            // (E) DIG status (INFO) -- how many digs are actively worked vs starved (waiting behind
+            // harvest+share for pool). Starved digs are expected at a small pool, NOT a problem; this
+            // line makes the benign state visible so it isn't mistaken for a stall.
+            let digWorked = 0, digStarved = 0;
+            for (const t of digList) {
+                const placed = (remain[t] ? remain[t].prep : 0) + (placedPrep[t] || 0);
+                const requested = digPlan[t] || 0;
+                if (requested > 0 && placed >= 0.5 * requested) digWorked++; else digStarved++;
+            }
+            findings.push({ sev: "INFO", code: "DIG",
+                msg: "digs " + digList.length + ": " + digWorked + " worked, " + digStarved +
+                     " waiting for pool (perDig " + perDigCap + ", budget " + digBudgetTotal + ")" });
 
             // write health file for hud1's snapshot to surface; toast HIGH findings (debounced).
             try {
