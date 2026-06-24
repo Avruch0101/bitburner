@@ -40,14 +40,9 @@ export async function main(ns) {
     const DIG_BUDGET_FRAC = 0.50;   // max fraction of the pool spent on digs in total each loop. The
                                     // rest is reserved for HARVEST (current income). Digs are an
                                     // investment in future income; they must not starve present income.
-    const DIG_AFFORD_LOOPS = 3;     // a server is dig-eligible only if its prep cost can be covered by
-                                    // the dig budget within this many loops (prepCost <= digBudget *
-                                    // this). A server too expensive to prep with the current pool is
-                                    // DEFERRED -- digging it just pours the pool into a prep that never
-                                    // finishes. As the pool grows, the inequality flips and the server
-                                    // becomes eligible on its own. This is the gate that was missing:
-                                    // it's what makes megacorps (req 1000+, vast prep need) wait until
-                                    // the pool is big enough instead of black-holing it at mid-game.
+    const DIG_BUDGET_FRAC_COLD = 0.90;  // cold-start budget (harvest empty): no income to protect, so
+                                    // prep aggressively to reach first earner fast. Leaves a sliver for
+                                    // xpw so leveling still ticks. Reverts to DIG_BUDGET_FRAC once earning.
     const DIG_MIN_SLOTS   = 3;      // always allow at least this many parallel digs even if the budget
                                     // math would allow fewer, so the pipeline never fully stalls.
     const DIG_MAX_SLOTS_DEFAULT = 24;   // hard ceiling on parallel digs (prevents over-fragmentation).
@@ -192,17 +187,21 @@ export async function main(ns) {
 
             // ---- POOL-RELATIVE DIG SELECTION --------------------------------------------------
             // All thresholds are fractions of the live pool, so the same logic holds whether the
-            // pool is 2.4k threads (BN4 mid-game) or 2M (BN1 endgame). Three rules:
-            //   (1) per-dig cap     = DIG_POOL_FRAC * pool  -- no one server monopolizes the pool
-            //   (2) affordability   = prepCost <= digBudget * DIG_AFFORD_LOOPS -- defer servers too
-            //                         expensive to prep with the current pool (they'd black-hole it)
-            //   (3) total dig spend <= DIG_BUDGET_FRAC * pool -- digs never starve harvest income
-            // Ordering is PRODUCTIVE-FIRST: fast/cheap-to-prep high-score servers claim budget before
-            // speculative fat servers. Income flows now; fat servers prep on leftover capacity and
-            // become eligible naturally as the pool grows (rule 2 flips on its own -- no band logic).
+            // pool is 2.4k threads (BN4 mid-game) or 2M (BN1 endgame). Two rules:
+            //   (1) per-dig cap     = DIG_POOL_FRAC * pool  -- no one server monopolizes the pool;
+            //                         a server simply preps incrementally over need/cap loops
+            //   (2) total dig spend <= DIG_BUDGET_FRAC * pool -- digs never starve harvest income
+            // Ordering is PRODUCTIVE-FIRST (by score): the efficient mid-tier servers claim budget
+            // before low-score fat servers. Fat servers still get dug, just lower priority, and they
+            // prep slowly via the per-dig cap. As the pool grows, perDigCap grows and they speed up
+            // -- no band-specific logic, no affordability gate (which caused a cheap-server inversion).
             const perDigCap = Math.max(1, Math.floor(totalCap * DIG_POOL_FRAC));
-            const digBudgetTotal = Math.max(1, Math.floor(totalCap * DIG_BUDGET_FRAC));
-            const affordCeil = digBudgetTotal * DIG_AFFORD_LOOPS;   // max prepCost a dig may have to be eligible
+            // Dig budget is ADAPTIVE: the DIG_BUDGET_FRAC cap exists to protect HARVEST income from
+            // being starved by digs. At cold start (harvest empty) there is no income to protect, so
+            // the cap's justification is absent -- prep harder to reach first income faster. Once any
+            // server is earning, fall back to the normal split so digs can't starve it.
+            const effBudgetFrac = harvest.length === 0 ? DIG_BUDGET_FRAC_COLD : DIG_BUDGET_FRAC;
+            const digBudgetTotal = Math.max(1, Math.floor(totalCap * effBudgetFrac));
             const DIG_MAX_SLOTS = DIG_SLOTS_ARG > 0 ? DIG_SLOTS_ARG : DIG_MAX_SLOTS_DEFAULT;
 
             // candidate cold servers, each with its (uncapped) prep need and score.
@@ -230,21 +229,20 @@ export async function main(ns) {
                 digCands.sort((a, b) => (b.score - a.score) || (a.t < b.t ? -1 : 1));
             }
 
-            // Greedily admit digs in productive order, subject to all three rules. A server that fails
-            // the affordability gate is DEFERRED (logged, not dropped) -- it'll qualify once the pool
-            // grows. Cap each admitted dig's prep at perDigCap; stop when the running budget is spent.
+            // Admit digs in priority order, each capped at perDigCap, until the dig budget or the
+            // slot ceiling is hit. NO affordability gate: with a per-dig cap, every server preps
+            // INCREMENTALLY over need/perDigCap loops -- there is no "unaffordable" server, only
+            // slow-prepping ones. Score order already prioritizes the productive mid-tier servers;
+            // the per-dig cap already stops any one server from monopolizing the pool; the budget
+            // already protects harvest income. An earlier affordability gate here caused an inversion
+            // (cheap high-score servers deferred while one expensive server dug) and is removed.
             let digList = [];
             const digPlan = {};        // t -> capped prep threads to request this loop
-            const digDeferred = [];    // t's skipped this loop because too expensive for current pool
             let digSpend = 0;
             for (const c of digCands) {
                 if (digList.length >= DIG_MAX_SLOTS) break;
-                // affordability gate (rule 2): too expensive to prep with the pool soon? defer it.
-                // (Always allow the cheapest DIG_MIN_SLOTS through even if pricey, so the pipeline
-                //  never fully stalls on a fleet where everything left is expensive.)
-                if (c.need > affordCeil && digList.length >= DIG_MIN_SLOTS) { digDeferred.push(c.t); continue; }
-                const capped = Math.min(c.need, perDigCap);                  // rule 1: per-dig cap
-                if (digSpend + capped > digBudgetTotal && digList.length >= DIG_MIN_SLOTS) break;  // rule 3
+                const capped = Math.min(c.need, perDigCap);                  // per-dig cap (rule 1)
+                if (digSpend + capped > digBudgetTotal && digList.length >= DIG_MIN_SLOTS) break;  // budget (rule 3)
                 digList.push(c.t);
                 digPlan[c.t] = capped;
                 digSpend += capped;
@@ -255,7 +253,12 @@ export async function main(ns) {
             const crews = {};
             for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
             const want = {};        // target -> { hack, prep }  (the steady state we want running)
-            for (const t of harvest) want[t] = { hack: crews[t].hackT, prep: crews[t].prepT };
+            // Harvest prep is capped at perDigCap too. Without Formulas.exe, growthAnalyze overcounts
+            // grow threads when a server is below max money, so crewFor's prepT can balloon (observed:
+            // 1847 threads on a $5.6M server). Uncapped, one harvest server's prep monopolizes the pool
+            // and starves digs + other harvest. prep.js weakens-then-grows over cycles, so a bounded
+            // maintenance crew still keeps the server prepped -- it just self-corrects over a few loops.
+            for (const t of harvest) want[t] = { hack: crews[t].hackT, prep: Math.min(crews[t].prepT, perDigCap) };
             for (const t of digList) {
                 if (want[t]) continue;                              // harvest wins if somehow both
                 want[t] = { hack: 0, prep: digPlan[t] };            // digs: pool-capped prep, no seed-hack
@@ -447,7 +450,6 @@ export async function main(ns) {
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
                     + (batchSet.length ? "  batch[" + batchSet.length + "] " + batchSet.join(",") : "")
                     + "  dig[" + digList.length + "] " + (digList.map(t => t + "(p" + (digPlan[t] || 0) + ")").join(",") || "(none)")
-                    + (digDeferred.length ? "  deferred[" + digDeferred.length + "] " + digDeferred.slice(0, 5).join(",") + (digDeferred.length > 5 ? "..." : "") : "")
                     + "  cap " + totalCap + "t (perDig " + perDigCap + " / digBudget " + digBudgetTotal + ")  idle " + idle + "t");
             }
 
