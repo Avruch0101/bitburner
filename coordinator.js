@@ -280,8 +280,10 @@ export async function main(ns) {
 
             // --- what's actually running now, grouped by target + script ---
             const byTarget = {};    // target -> { hack: [{pid,threads}], prep: [{pid,threads}] }
+            let shareThreads = 0;   // sh.js worker threads across the fleet (share consumes pool legitimately)
             for (const h of all.concat("home")) {
                 for (const p of ns.ps(h)) {
+                    if (p.filename === "sh.js") { shareThreads += p.threads; continue; }
                     if (p.filename !== PREP && p.filename !== HACK) continue;
                     const tgt = p.args[0];
                     if (!tgt) continue;
@@ -364,9 +366,13 @@ export async function main(ns) {
             const findings = [];   // { sev: "HIGH"|"WARN"|"INFO", code, msg }
 
             // (A) PLACEMENT_SHORTFALL -- coord wanted harvest hack threads but couldn't place them.
-            // Signature of: pool consumed by non-coord scripts (the overnight sharecap bug), or
-            // fragmentation, or a placement/deadband regression. Needs 2 consecutive loops to fire
-            // (one-loop dips during reconcile are normal).
+            // Signature of: pool consumed by non-coord scripts, fragmentation, or a placement regression.
+            // BUT: share (sh.js) legitimately consumes the pool by design when you're rep-grinding, so a
+            // hack shortfall while share is running is EXPECTED, not a bug -- it's the tradeoff you chose.
+            // We only escalate to HIGH when the shortfall is NOT explained by share (the real-leak case:
+            // the overnight bug where share ballooned and harvest starved). Concretely: HIGH only if even
+            // AFTER accounting for share's threads, there still wouldn't be room for the wanted hack --
+            // i.e. share alone doesn't explain the gap. Otherwise WARN (visible, not alarming).
             let wantHack = 0, gotHack = 0;
             for (const t of harvest) {
                 wantHack += want[t].hack;
@@ -375,10 +381,22 @@ export async function main(ns) {
             if (wantHack >= 50 && gotHack < 0.5 * wantHack) {
                 health.shortfallLoops++;
                 if (health.shortfallLoops >= 2) {
-                    findings.push({ sev: "HIGH", code: "PLACEMENT_SHORTFALL",
-                        msg: "harvest hack wanted " + wantHack + ", placed " + gotHack + " (" +
-                             Math.round(100 * gotHack / wantHack) + "%) for " + health.shortfallLoops +
-                             " loops -- pool likely eaten by non-coord scripts (share?) or fragmented" });
+                    const missing = wantHack - gotHack;
+                    // does share explain the gap? share-explained if share accounts for most (>=80%)
+                    // of the missing hack -- the small remainder is normal prep/dig contention and
+                    // fragmentation, not a leak. Requiring share to cover 100% was too strict (a 484
+                    // gap with 400 share is clearly share-dominated, not a non-share leak).
+                    const shareExplains = shareThreads >= 0.8 * missing;
+                    if (shareExplains) {
+                        findings.push({ sev: "WARN", code: "PLACEMENT_SHORTFALL",
+                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + Math.round(100 * gotHack / wantHack) +
+                                 "%); " + missing + " unplaced, explained by share (" + shareThreads + "t). Expected under share pressure -- kill share to reclaim, or accept for the rep grind." });
+                    } else {
+                        findings.push({ sev: "HIGH", code: "PLACEMENT_SHORTFALL",
+                            msg: "harvest hack " + gotHack + "/" + wantHack + " (" + Math.round(100 * gotHack / wantHack) +
+                                 "%) for " + health.shortfallLoops + " loops; " + missing + " unplaced, NOT explained by share (" +
+                                 shareThreads + "t) -- a non-share consumer ate the pool or placement is failing." });
+                    }
                 }
             } else {
                 health.shortfallLoops = 0;
