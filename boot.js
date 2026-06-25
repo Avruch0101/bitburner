@@ -16,10 +16,14 @@ export async function main(ns) {
     ns.disableLog("ALL");
 
     // ---- config ----
-    const SHARE_CAP      = Number(ns.args[0]) || 120000;  // sharecap thread cap (sharecap idles once reached)
-    const NO_SHARE       = ns.args[1] === 1 || ns.args[1] === "1";
-    const PURCHASER_FRAC = 0.5;       // purchaser spend fraction (of cash above reserve)
-    const PURCHASER_RES  = 500_000;   // purchaser cash floor
+    // Args (positional):
+    //   [0] shareCap       sharecap thread cap. default 120000. 0 = NO share.
+    //   [1] purchaserFrac  cloud purchaser spend fraction. default 0 = purchaser OFF.
+    //                      >0 enables purchaser at that frac (e.g. 0.5). Cloud doesn't persist
+    //                      install AND spends cash, so it's OFF by default -- opt in deliberately.
+    const SHARE_CAP      = ns.args[0] !== undefined ? Number(ns.args[0]) : 120000;  // 0 disables share
+    const PURCHASER_FRAC = ns.args[1] !== undefined ? Number(ns.args[1]) : 0;        // 0 = purchaser off
+    const PURCHASER_RES  = 500_000;   // purchaser cash floor (only used if purchaser enabled)
     const SETTLE_MS      = 600;       // pause between ordered launches so each claims RAM before the next
 
     const log = (m) => ns.tprint("[boot] " + m);
@@ -41,14 +45,19 @@ export async function main(ns) {
     log(pid ? "sing.js up" : "sing.js FAILED to launch");
     await ns.sleep(SETTLE_MS);
 
-    // ---- 2. purchaser: cloud rebuild (cloud doesn't persist install, so this restarts it) ----
-    pid = ns.run("purchaser.js", 1, PURCHASER_FRAC, PURCHASER_RES);
-    log(pid ? ("purchaser.js up (" + PURCHASER_FRAC + " frac, $" + (PURCHASER_RES / 1e3) + "k reserve)") : "purchaser.js FAILED");
-    await ns.sleep(SETTLE_MS);
+    // ---- 2. purchaser: cloud rebuild -- OFF by default (spends cash, cloud doesn't persist install).
+    //         Enable only with an explicit purchaserFrac arg. ----
+    if (PURCHASER_FRAC > 0) {
+        pid = ns.run("purchaser.js", 1, PURCHASER_FRAC, PURCHASER_RES);
+        log(pid ? ("purchaser.js up (" + PURCHASER_FRAC + " frac, $" + (PURCHASER_RES / 1e3) + "k reserve)") : "purchaser.js FAILED");
+        await ns.sleep(SETTLE_MS);
+    } else {
+        log("purchaser SKIPPED (off by default; pass arg[1]>0 to enable cloud buying)");
+    }
 
     // ---- 3. sharecap WITH CAP -- MUST precede coord (boot-order constraint) ----
-    if (NO_SHARE || SHARE_CAP <= 0) {
-        log("share SKIPPED (noShare set)");
+    if (SHARE_CAP <= 0) {
+        log("share SKIPPED (shareCap 0)");
     } else {
         pid = ns.run("sharecap.js", 1, SHARE_CAP);
         log(pid ? ("sharecap.js up (cap " + SHARE_CAP + "t) -- claims its slice before coord") : "sharecap.js FAILED");
@@ -70,7 +79,8 @@ export async function main(ns) {
         log(pid ? "hud1.js up" : "hud1.js FAILED");
     }
 
-    log("bootstrap complete. " + (NO_SHARE ? "(no share) " : "share cap " + SHARE_CAP + "t ") +
+    log("bootstrap complete. " + (SHARE_CAP <= 0 ? "(no share) " : "share cap " + SHARE_CAP + "t ") +
+        (PURCHASER_FRAC > 0 ? "+ purchaser " + PURCHASER_FRAC + " " : "+ no purchaser ") +
         "-- watch coord log for harvest growth. Launch hud2 manually for faction/aug state.");
 }
 
