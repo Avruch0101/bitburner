@@ -5,15 +5,40 @@ export async function main(ns) {
     // (not what's on disk or in the repo). This is the immediate tell for a stale/deferred pull:
     // if the snapshot's coord version lags the version you just pushed, the running process didn't
     // pick up the new code (kill coord -> pull -> reload -> rerun). Format: vMAJOR.MINOR (date).
-    const COORD_VERSION = "v2.6 (2026-06-25)";   // + dig budget as CLI arg[5] (default 0.85); cold-start honors it via max
-    const numTargets   = Number(ns.args[0]) || 40;    // max harvest targets (high default; the value-floor + level
-                                 // gates below filter, so a high cap just stops artificially starving harvest)
-    const levelRatio   = Number(ns.args[1]) || 0.9;   // target required-level <= ratio * your level (0.9 leaves a
-    const BATCH_MAX = ns.args[3] !== undefined ? Number(ns.args[3]) : 7;   // CAP on batchers (0 = batching off).
+    const COORD_VERSION = "v2.7 (2026-06-25)";   // + Formulas.exe-aware prep math (accurate grow threads, falls back if absent); arg-comment usage examples
+
+    // ================================ ARG REFERENCE (read me) ================================
+    //   run coordinator.js [numTargets] [levelRatio] [digSlots] [batchMax] [xpw] [digBudget]
+    //                          40           0.9          0          7         1       0.85       <- defaults
+    //
+    //   Args are POSITIONAL: to set a later one you must fill the earlier ones (use the defaults).
+    //   You can OMIT trailing args to keep their defaults. Common launches:
+    //     run coordinator.js                          -> all defaults (xpw ON, balanced)
+    //     run coordinator.js 40 0.9 0 7 0             -> income mode: xpw OFF (frees its pool for $)
+    //     run coordinator.js 40 0.9 0 7 0 0.95        -> income mode + push almost all pool into digs
+    //     run coordinator.js 40 0.9 0 0 0             -> income mode, batching OFF too (pure harvest/dig)
+    //     run coordinator.js 40 0.9 0 7 1             -> rebuild mode: xpw ON (level up on idle pool)
+    //
+    //   [0] numTargets  max harvest servers. Default 40 (high on purpose -- filters below trim it).
+    //   [1] levelRatio  only target servers whose required level <= this * your level. 0.9 = safe margin.
+    //   [2] digSlots    how many servers prep in parallel. 0 = AUTO (sizes from the pool). Set a number to force.
+    //   [3] batchMax    cap on HWGW batchers. 0 = batching off. Actual count auto-ramps up to this as servers prep.
+    //   [4] xpw         leveling fill: 1/omitted = ON (idle pool -> XP), 0 = OFF (idle pool -> income). Use 0 once high-level.
+    //   [5] digBudget   max fraction of pool spent prepping (digging) per loop. 0.85 default. Higher = prep faster,
+    //                   leave less for harvest headroom. Lower = protect harvest more. Flex this live to tune the split.
+    // =========================================================================================
+
+    const numTargets   = Number(ns.args[0]) || 40;    // [0] max harvest targets. e.g. `...js 25` caps harvest at 25.
+                                 // High default is fine: the value-floor + level gates below filter, so a high cap
+                                 // just stops artificially starving harvest. Lower it only to deliberately focus fewer servers.
+    const levelRatio   = Number(ns.args[1]) || 0.9;   // [1] only harvest servers whose required hacking level is
+                                 // <= this * your level. 0.9 leaves a safety margin (you out-level targets, so hacks
+                                 // land reliably). e.g. `...js 40 0.75` is more conservative; 1.0 targets right up to your level.
+    const BATCH_MAX = ns.args[3] !== undefined ? Number(ns.args[3]) : 7;   // [3] CAP on HWGW batchers (0 = batching
+                                 // off). e.g. `...js 40 0.9 0 0` turns batching off; `...js 40 0.9 0 12` allows up to 12.
                                  // The ACTUAL count auto-adjusts each loop: min(BATCH_MAX, number of PREPPED servers
                                  // worth batching, i.e. maxMoney >= BATCH_FLOOR). So a cold start runs at 0 batchers
                                  // on its own and ramps up as fat servers prep -- no manual 0->5 dance on restart.
-                                 // 4th CLI arg is now this cap: `run coordinator.js <numTargets> <levelRatio> <digTargets> <batchMax>`.
     const BATCH_FLOOR = 1e9;     // a server must be at least this fat ($1b maxMoney) to deserve a batcher slot;
                                  // below it, it stays in prep-and-hold harvest. Keeps batchers off starter servers.
                                  // LOWERED from $10b for BN4: server money is cut ~75-80%, so the fattest servers
@@ -27,9 +52,10 @@ export async function main(ns) {
     const PREP_MARGIN  = 1.5;    // prep threads over the bare grow+weaken need, for reactive-timing slack
     const VALUE_FLOOR  = 0.02;   // skip harvesting any target worth < this fraction of your richest one
     const STICKY_EXTRA = 3;      // keep up to numTargets + this many prepped earners harvesting during a handoff
-    const DIG_SLOTS_ARG = ns.args[2] !== undefined ? Number(ns.args[2]) : 0;   // 0/omitted = AUTO.
-                                 // Pool-relative dig selection (below) auto-sizes parallel digs from the live
-                                 // pool; an explicit 3rd arg overrides DIG_MAX_SLOTS (the parallel-dig ceiling).
+    const DIG_SLOTS_ARG = ns.args[2] !== undefined ? Number(ns.args[2]) : 0;   // [2] parallel dig (prep) slots.
+                                 // 0/omitted = AUTO (sizes from the live pool -- recommended). e.g. `...js 40 0.9 5`
+                                 // forces exactly 5 parallel digs. Pool-relative selection (below) auto-sizes when 0;
+                                 // an explicit value overrides DIG_MAX_SLOTS (the parallel-dig ceiling).
                                  // `run coordinator.js <numTargets> <levelRatio> <digMaxSlots> <batchMax>`.
     // --- POOL-RELATIVE DIG ALLOCATION (replaces the old absolute DIG_PREP_CAP) -----------------
     // The recurring coord-scaling problem: dig logic reasoned in ABSOLUTE thread counts (a 40000-
@@ -70,7 +96,7 @@ export async function main(ns) {
     // --- XP farm: fill leftover idle RAM with weaken() for hacking XP. The harvest/dig/batch placements
     //     run their normal course; xpw is a tail filler that takes whatever pool is left and gives it back
     //     when those need to grow. Hacking XP only -- weaken/grow/hack don't train combat stats. Combat
-    //     requires gym/crime, which without Singularity (SF4) is a manual UI activity in BN1.
+    //     requires gym/crime; with Singularity (SF4, available now) sing.js can automate that separately.
     const XP_ENABLE   = ns.args[4] !== undefined ? (Number(ns.args[4]) !== 0) : true;
                                        // master switch, now CLI-controllable: arg[4]=0 disables xpw.
                                        // run `coordinator.js 40 0.9 0 7 0` -> xpw OFF (frees its pool for
@@ -114,6 +140,9 @@ export async function main(ns) {
     while (true) {
         loopNum++;
         try {
+            // Formulas.exe gives EXACT grow-thread math (accounts for current security); it's lost on
+            // every install, so check each loop and let crewFor/prepCost fall back to growthAnalyze if absent.
+            const useFormulas = hasFormulas(ns);
             // --- scan ---
             const seen = new Set(["home"]), queue = ["home"], all = [];
             while (queue.length) {
@@ -238,7 +267,7 @@ export async function main(ns) {
                 .filter(t => !preppedSet.has(t) && !batchSetS.has(t))
                 .map(t => ({
                     t,
-                    need: Math.max(1, Math.ceil(prepCost(ns, t) * PREP_MARGIN)),
+                    need: Math.max(1, Math.ceil(prepCost(ns, t, useFormulas) * PREP_MARGIN)),
                     score: scoreOf[t] || 0,
                     money: ns.getServerMaxMoney(t),
                 }));
@@ -289,7 +318,7 @@ export async function main(ns) {
             // --- desired plan: per-target thread targets (harvest = hack+prep crew; digs = capped prep) ---
             const HACK_CAP = Math.max(1, Math.floor(totalCap * 0.20));   // no single target hogs >20% on hack
             const crews = {};
-            for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP);
+            for (const t of harvest) crews[t] = crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP, useFormulas);
             const want = {};        // target -> { hack, prep }  (the steady state we want running)
             // Harvest prep is capped at perDigCap too. Without Formulas.exe, growthAnalyze overcounts
             // grow threads when a server is below max money, so crewFor's prepT can balloon (observed:
@@ -565,7 +594,8 @@ export async function main(ns) {
                 ns.tprint("coordinator @L" + L + ": harvest " + (crewStr || "(none)")
                     + (batchSet.length ? "  batch[" + batchSet.length + "] " + batchSet.join(",") : "")
                     + "  dig[" + digList.length + "] " + (digList.map(t => t + "(p" + (digPlan[t] || 0) + ")").join(",") || "(none)")
-                    + "  cap " + totalCap + "t (perDig " + perDigCap + " / digBudget " + digBudgetTotal + ")  idle " + idle + "t");
+                    + "  cap " + totalCap + "t (perDig " + perDigCap + " / digBudget " + digBudgetTotal + ")  idle " + idle + "t"
+                    + (useFormulas ? "  [Formulas]" : ""));
             }
 
             // --- PHASE 2: XP fill. Run AFTER harvest/dig/batch placement so it consumes only true leftovers.
@@ -661,12 +691,40 @@ function killExcess(ns, procs, desired) {
 }
 
 // Size a harvest crew for one target from its own hack/grow economics.
-function crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP) {
+// Accurate grow-thread estimate. ns.growthAnalyze ignores the server's CURRENT security -- it assumes
+// min security -- so on a cold server (high sec) it MIS-estimates the real grow need, which is the root
+// of the long-standing overcounting (the foodnstuff phantom 1847-thread crew; inflated DIG_BLACKHOLE
+// "need" values). Formulas.exe (ns.formulas) computes grow threads from the server's ACTUAL state and
+// the player's real multipliers -- exact. But Formulas.exe is LOST every aug install, so coord must
+// work without it too: if ns.formulas isn't available, fall back to growthAnalyze. Call hasFormulas()
+// once per loop, not per server, to avoid repeated try/catch cost.
+function hasFormulas(ns) {
+    try { ns.formulas.hacking.growThreads; return ns.fileExists("Formulas.exe", "home"); }
+    catch (e) { return false; }
+}
+// grow threads to take a server from its CURRENT money to max (or by a multiplier if curMoney given).
+function growThreadsFor(ns, t, useFormulas, targetMultIfNoState) {
+    if (useFormulas) {
+        try {
+            const so = ns.getServer(t);
+            const po = ns.getPlayer();
+            // grow from current money up to max, at current security -- the accurate figure.
+            const need = ns.formulas.hacking.growThreads(so, po, ns.getServerMaxMoney(t));
+            if (isFinite(need) && need >= 0) return Math.ceil(need);
+        } catch (e) { /* fall through to analyze */ }
+    }
+    // fallback: growthAnalyze with the requested multiplier (min-security assumption -- approximate).
+    return Math.ceil(ns.growthAnalyze(t, targetMultIfNoState));
+}
+
+function crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP, useFormulas) {
     const perHack = ns.hackAnalyze(t);                       // fraction stolen per hack thread
     let hackT = perHack > 0 ? Math.max(1, Math.floor(STEAL_FRAC / perHack)) : 1;
     if (hackT > HACK_CAP) hackT = HACK_CAP;
     const growMult = 1 / (1 - STEAL_FRAC);                   // regrow what the skim removes
-    const growT = Math.max(1, Math.ceil(ns.growthAnalyze(t, growMult)));
+    // For a prepped harvest server, growthAnalyze(growMult) at min sec is correct, so Formulas adds
+    // little here -- but use it when available for exactness (handles partial-money edge states).
+    const growT = Math.max(1, growThreadsFor(ns, t, useFormulas, growMult));
     const wpt = ns.weakenAnalyze(1) || 0.05;                 // security removed per weaken thread
     const secAdd = ns.hackAnalyzeSecurity(hackT, t) + ns.growthAnalyzeSecurity(growT, t);
     const weakenT = Math.max(1, Math.ceil(secAdd / wpt));
@@ -676,12 +734,23 @@ function crewFor(ns, t, STEAL_FRAC, PREP_MARGIN, HACK_CAP) {
 
 // Rough threads-to-prep estimate for picking the fastest bootstrap target:
 // grow threads to refill from current money + weaken threads for current security excess.
-// Lower = closer to prepped / cheaper to bring online.
-function prepCost(ns, t) {
+// Lower = closer to prepped / cheaper to bring online. With Formulas.exe this is EXACT (accounts for
+// the server's real security); without it, growthAnalyze under/over-counts on cold servers.
+function prepCost(ns, t, useFormulas) {
     const max = ns.getServerMaxMoney(t);
     const cur = Math.max(ns.getServerMoneyAvailable(t), 1);
-    const mult = Math.min(max / cur, 1e6);                  // cap to avoid Infinity on near-empty servers
-    const growT = mult > 1 ? ns.growthAnalyze(t, mult) : 0;
+    let growT;
+    if (useFormulas) {
+        try {
+            const so = ns.getServer(t), po = ns.getPlayer();
+            growT = ns.formulas.hacking.growThreads(so, po, max);
+            if (!isFinite(growT) || growT < 0) growT = 0;
+        } catch (e) { useFormulas = false; }
+    }
+    if (!useFormulas) {
+        const mult = Math.min(max / cur, 1e6);              // cap to avoid Infinity on near-empty servers
+        growT = mult > 1 ? ns.growthAnalyze(t, mult) : 0;
+    }
     const secExcess = ns.getServerSecurityLevel(t) - ns.getServerMinSecurityLevel(t);
     const weakenT = secExcess / (ns.weakenAnalyze(1) || 0.05);
     return growT + weakenT;
