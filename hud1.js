@@ -452,7 +452,7 @@ export async function main(ns) {
                 const highs = fs.filter(f => f.sev === "HIGH");
                 const warns = fs.filter(f => f.sev === "WARN");
                 const infos = fs.filter(f => f.sev === "INFO");
-                lines.push("COORD HEALTH (loop " + (healthRead.loop || "?") + "): " +
+                lines.push("COORD HEALTH " + (healthRead.ver || "(no version)") + " (loop " + (healthRead.loop || "?") + "): " +
                     highs.length + " HIGH, " + warns.length + " WARN");
                 for (const f of highs) lines.push("  [HIGH] " + f.code + ": " + f.msg);
                 for (const f of warns) lines.push("  [WARN] " + f.code + ": " + f.msg);

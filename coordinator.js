@@ -1,5 +1,11 @@
 /** @param {NS} ns */
 export async function main(ns) {
+    // VERSION STAMP -- bump on every coord change. Emitted into coord-health.txt by the RUNNING
+    // process and surfaced in hud1's snapshot, so you can see what's actually executing in memory
+    // (not what's on disk or in the repo). This is the immediate tell for a stale/deferred pull:
+    // if the snapshot's coord version lags the version you just pushed, the running process didn't
+    // pick up the new code (kill coord -> pull -> reload -> rerun). Format: vMAJOR.MINOR (date).
+    const COORD_VERSION = "v2.3 (2026-06-25)";   // income-gated shortfall + refined blackhole + fmtMoney + budget-overrun fix + adaptive cold budget + 0.20 pool frac
     const numTargets   = Number(ns.args[0]) || 40;    // max harvest targets (high default; the value-floor + level
                                  // gates below filter, so a high cap just stops artificially starving harvest)
     const levelRatio   = Number(ns.args[1]) || 0.9;   // target required-level <= ratio * your level (0.9 leaves a
@@ -66,6 +72,7 @@ export async function main(ns) {
                                        // grow-side deadband: xpw only grows when wantXpwT exceeds curXpwT by
                                        // more than XP_SLACK threads, so small per-loop jitter doesn't churn.
     ns.disableLog("ALL");
+    ns.tprint("coordinator " + COORD_VERSION + " starting...");
 
     // --- singleton guard: kill any other copy of this coordinator (newest wins) ---
     const me = ns.getRunningScript();
@@ -508,7 +515,7 @@ export async function main(ns) {
 
             // write health file for hud1's snapshot to surface; toast HIGH findings (debounced).
             try {
-                ns.write("coord-health.txt", JSON.stringify({ ts: Date.now(), loop: loopNum, L, findings }), "w");
+                ns.write("coord-health.txt", JSON.stringify({ ts: Date.now(), ver: COORD_VERSION, loop: loopNum, L, findings }), "w");
             } catch (e) {}
             for (const f of findings) {
                 if (f.sev !== "HIGH") continue;
