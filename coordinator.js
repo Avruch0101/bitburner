@@ -5,7 +5,7 @@ export async function main(ns) {
     // (not what's on disk or in the repo). This is the immediate tell for a stale/deferred pull:
     // if the snapshot's coord version lags the version you just pushed, the running process didn't
     // pick up the new code (kill coord -> pull -> reload -> rerun). Format: vMAJOR.MINOR (date).
-    const COORD_VERSION = "v2.4 (2026-06-25)";   // + xpw CLI toggle (arg[4]=0 disables xpw & sweeps it)
+    const COORD_VERSION = "v2.6 (2026-06-25)";   // + dig budget as CLI arg[5] (default 0.85); cold-start honors it via max
     const numTargets   = Number(ns.args[0]) || 40;    // max harvest targets (high default; the value-floor + level
                                  // gates below filter, so a high cap just stops artificially starving harvest)
     const levelRatio   = Number(ns.args[1]) || 0.9;   // target required-level <= ratio * your level (0.9 leaves a
@@ -37,17 +37,27 @@ export async function main(ns) {
     // the live pool. 40k threads is trivial at a 200k pool (BN1 endgame) and catastrophic at a 2.4k
     // pool (BN4 mid-game) -- same number, opposite meaning -- so the absolute constants broke at
     // every band boundary and got re-patched. These ratio-based knobs self-adjust at any pool size:
-    const DIG_POOL_FRAC   = 0.20;   // no single dig may claim more than this fraction of the pool.
-                                    // Replaces DIG_PREP_CAP. At 1.7k pool -> 334 thread cap; at 200k
-                                    // pool -> 40k cap. Scales itself. Was 0.10, but that capped digs so
-                                    // low (166 at a 1.7k pool) that servers with large prep needs
-                                    // (5000+ threads) crawled at ~3%/loop and read as frozen (the
-                                    // DIG_BLACKHOLE warnings). 0.20 doubles per-dig throughput so fat
-                                    // servers actually converge, while still bounding any one dig to a
-                                    // fifth of the pool. Tune up if big servers still prep too slowly.
-    const DIG_BUDGET_FRAC = 0.50;   // max fraction of the pool spent on digs in total each loop. The
-                                    // rest is reserved for HARVEST (current income). Digs are an
-                                    // investment in future income; they must not starve present income.
+    const DIG_POOL_FRAC   = 0.30;   // no single dig may claim more than this fraction of the pool.
+                                    // Replaces DIG_PREP_CAP. Scales with pool. Raised 0.20 -> 0.30 once
+                                    // xpw (the old idle-soak) was disabled: with few cold servers left,
+                                    // 0.20 left the pool idle (3 digs x 20% = 60%, rest idle). 0.30 lets
+                                    // idle capacity pour into the remaining fat servers to prep them
+                                    // faster. NOTE diminishing returns -- past a point fat servers are
+                                    // weaken-CYCLE-limited (wall-clock), not thread-limited; this trades
+                                    // some idle pool for faster prep, not perfect utilization. With
+                                    // DIG_MIN_SLOTS=3 and budget 0.85, 3x0.30=0.90 > 0.85 so the budget
+                                    // shares the 3rd dig's allocation (handled by the min-slot remainder).
+    const DIG_BUDGET_FRAC = ns.args[5] !== undefined ? Number(ns.args[5]) : 0.85;
+                                    // max fraction of the pool spent on digs in total each loop, now
+                                    // CLI-flexible: arg[5] (e.g. `coordinator.js 40 0.9 0 7 0 0.85`).
+                                    // The rest is headroom for HARVEST (current income). NOTE: placement
+                                    // order (harvest hack -> harvest prep -> dig prep) is the REAL
+                                    // protection for income -- harvest always claims its threads before
+                                    // digs run. So this fraction only needs to leave a little headroom,
+                                    // not half. It was 0.50, which left the pool HALF-IDLE once xpw (the
+                                    // old idle-soak) was disabled: harvest wanted only a small slice,
+                                    // digs were capped at 50%, and the remaining ~50% earned nothing.
+                                    // 0.85 lets digs absorb idle capacity; harvest still gets first claim.
     const DIG_BUDGET_FRAC_COLD = 0.90;  // cold-start budget (harvest empty): no income to protect, so
                                     // prep aggressively to reach first earner fast. Leaves a sliver for
                                     // xpw so leveling still ticks. Reverts to DIG_BUDGET_FRAC once earning.
@@ -214,8 +224,10 @@ export async function main(ns) {
             // Dig budget is ADAPTIVE: the DIG_BUDGET_FRAC cap exists to protect HARVEST income from
             // being starved by digs. At cold start (harvest empty) there is no income to protect, so
             // the cap's justification is absent -- prep harder to reach first income faster. Once any
-            // server is earning, fall back to the normal split so digs can't starve it.
-            const effBudgetFrac = harvest.length === 0 ? DIG_BUDGET_FRAC_COLD : DIG_BUDGET_FRAC;
+            // server is earning, fall back to the steady-state split. If arg[5] sets a steady-state
+            // frac HIGHER than the cold default, honor it at cold start too (max), so the arg isn't
+            // silently lowered when harvest is empty.
+            const effBudgetFrac = harvest.length === 0 ? Math.max(DIG_BUDGET_FRAC_COLD, DIG_BUDGET_FRAC) : DIG_BUDGET_FRAC;
             const digBudgetTotal = Math.max(1, Math.floor(totalCap * effBudgetFrac));
             const DIG_MAX_SLOTS = DIG_SLOTS_ARG > 0 ? DIG_SLOTS_ARG : DIG_MAX_SLOTS_DEFAULT;
 
