@@ -4,7 +4,16 @@
  */
 import { weakenThreadsToMin, growMultiplierToMax, GROW_SEC_PER_THREAD } from "batch-math.js";
 
-export const HOME_RESERVE = 24; // GB kept free on home
+// Home RAM the batch fleet must leave free, to MATCH coordinator.js's guardrail (coord reserves
+// ~25% of home for its controllers + headroom). This was a hardcoded 24 GB, which at a multi-TB
+// home is effectively zero -- so batchers filled the very space coord reserved, pushing home to 100%.
+// Computing it as 25%-of-home (with a 40 GB floor for small homes) keeps both systems consistent.
+// Note: coord ALSO adds 14GB * batcherCount on top; we don't replicate that here (the batchers can't
+// cheaply know their own count), but matching the 25% base is what closes the home-overrun gap.
+export function homeReserve(ns) {
+  const homeMax = ns.getServerMaxRam("home");
+  return Math.max(40, Math.floor(homeMax * 0.25));
+}
 
 export function getParams(ns, target) {
   const srv = ns.getServer(target);
@@ -53,7 +62,7 @@ export function pool(ns) {
     const max = ns.getServerMaxRam(h);
     if (max === 0) continue;
     let free = max - ns.getServerUsedRam(h);
-    if (h === "home") free -= HOME_RESERVE;
+    if (h === "home") free -= homeReserve(ns);
     if (free > 0) hosts.push({ host: h, free });
   }
   return hosts;

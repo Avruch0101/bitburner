@@ -13,7 +13,10 @@ export async function main(ns) {
     ns.ui.resizeTail(560, 480);
     const React = globalThis.React;
     const h = React.createElement;
-    const HOME_RESERVE = 24;   // match coordinator: GB kept free on home
+    // Home RAM reserved (not counted as available) -- must match coordinator.js's guardrail (25% of
+    // home) or the HUD over-reports free pool. Was a hardcoded 24 GB, which at a multi-TB home showed
+    // ~4 TB more "available" than coord actually allows. Computed per-loop below from live home RAM.
+    const homeReserveGB = () => Math.max(40, Math.floor(ns.getServerMaxRam("home") * 0.25));
     let action = null;
     let presetArg = null;      // coord preset name to pass when action === "preset"
     let pendingDump = null;    // "harvest" | "batch" -- printed to terminal next loop
@@ -75,20 +78,24 @@ export async function main(ns) {
                     const killed = ns.scriptKill("coordinator.js", "home");
                     ns.toast(killed ? "killed coord (workers still running)" : "coord not running", killed ? "success" : "warning", 2500);
                 } else if (action === "resetcoord") {
-                    // full reset: kill coord AND all prep/h workers fleet-wide for a clean re-allocation.
-                    // Does NOT auto-restart -- you restart coord (or via the restart button) to re-place
-                    // from scratch. Use when you want better server selection, not just a process bounce.
+                    // full reset: kill coord AND ALL workers it manages fleet-wide (prep/h harvest+dig
+                    // workers, AND batch workers bhack/bgrow/bweaken + batch controllers bbatch2) for a
+                    // clean re-allocation. Does NOT auto-restart -- restart coord to re-place from scratch.
+                    // Sweeping batch too is required: otherwise the batch fleet ORPHANS (keeps running,
+                    // holds tens of TB, but produces $0 once its coord relationship is stale) and the
+                    // fresh coord starves with no pool -- the income=$0 / batch-still-huge symptom.
                     // NOTE: own local scan -- the main loop's `all` isn't built until after this block.
+                    const RESET_KILL = new Set(["prep.js", "h.js", "bhack.js", "bgrow.js", "bweaken.js", "bbatch2.js"]);
                     const rseen = new Set(["home"]), rq = ["home"], rhosts = ["home"];
                     while (rq.length) { const c = rq.shift(); for (const n of ns.scan(c)) if (!rseen.has(n)) { rseen.add(n); rq.push(n); rhosts.push(n); } }
                     ns.scriptKill("coordinator.js", "home");
                     let killed = 0;
                     for (const host of rhosts) {
                         for (const p of ns.ps(host)) {
-                            if (p.filename === "prep.js" || p.filename === "h.js") { ns.kill(p.pid); killed++; }
+                            if (RESET_KILL.has(p.filename)) { ns.kill(p.pid); killed++; }
                         }
                     }
-                    ns.toast("reset coord + killed " + killed + " worker proc(s) -- restart coord now", "success", 3500);
+                    ns.toast("reset coord + killed " + killed + " worker proc(s) [incl. batch] -- restart coord now", "success", 3500);
                 }
             } catch (e) { ns.toast("action error: " + e, "error", 4000); }
             action = null;
@@ -157,7 +164,7 @@ export async function main(ns) {
             const maxR = ns.getServerMaxRam(host);
             if (maxR <= 0) continue;
             let avail = maxR - ns.getServerUsedRam(host);
-            if (host === "home") avail -= HOME_RESERVE;
+            if (host === "home") avail -= homeReserveGB();
             const free = Math.floor(avail / workerRam);
             if (free > 0) idle += free;
         }
