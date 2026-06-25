@@ -5,7 +5,7 @@ export async function main(ns) {
     // (not what's on disk or in the repo). This is the immediate tell for a stale/deferred pull:
     // if the snapshot's coord version lags the version you just pushed, the running process didn't
     // pick up the new code (kill coord -> pull -> reload -> rerun). Format: vMAJOR.MINOR (date).
-    const COORD_VERSION = "v2.3 (2026-06-25)";   // income-gated shortfall + refined blackhole + fmtMoney + budget-overrun fix + adaptive cold budget + 0.20 pool frac
+    const COORD_VERSION = "v2.4 (2026-06-25)";   // + xpw CLI toggle (arg[4]=0 disables xpw & sweeps it)
     const numTargets   = Number(ns.args[0]) || 40;    // max harvest targets (high default; the value-floor + level
                                  // gates below filter, so a high cap just stops artificially starving harvest)
     const levelRatio   = Number(ns.args[1]) || 0.9;   // target required-level <= ratio * your level (0.9 leaves a
@@ -61,7 +61,11 @@ export async function main(ns) {
     //     run their normal course; xpw is a tail filler that takes whatever pool is left and gives it back
     //     when those need to grow. Hacking XP only -- weaken/grow/hack don't train combat stats. Combat
     //     requires gym/crime, which without Singularity (SF4) is a manual UI activity in BN1.
-    const XP_ENABLE   = true;          // master switch. false disables fill and lets existing xpw workers die off
+    const XP_ENABLE   = ns.args[4] !== undefined ? (Number(ns.args[4]) !== 0) : true;
+                                       // master switch, now CLI-controllable: arg[4]=0 disables xpw.
+                                       // run `coordinator.js 40 0.9 0 7 0` -> xpw OFF (frees its pool for
+                                       // income; coord actively sweeps existing xpw workers, see below).
+                                       // Omit arg[4] (or nonzero) -> xpw ON (default, fills idle pool w/ XP).
     const XP_TARGET   = "joesguns";    // weaken target. low base sec -> fast cycles -> more XP/sec per thread.
                                        // any rooted low-level server works; joesguns is the traditional pick.
     const XP_WORKER   = "xpw.js";      // worker script -- MUST be added to pull.js or it won't deploy after pull
@@ -595,6 +599,18 @@ export async function main(ns) {
                         }
                     }
                 }
+            } else if (!XP_ENABLE) {
+                // xpw disabled (arg[4]=0): actively SWEEP all xpw workers fleet-wide so the pool frees
+                // THIS loop, instead of waiting for harvest/dig crews to slowly reclaim it. Without this
+                // sweep, disabling xpw just stops replenishment and the ~28TB it holds drains only as
+                // other crews happen to grow. The sweep makes "xpw off" immediate and clean.
+                let swept = 0;
+                for (const h of all.concat("home")) {
+                    for (const p of ns.ps(h)) {
+                        if (p.filename === XP_WORKER) { ns.kill(p.pid); swept += p.threads; }
+                    }
+                }
+                if (swept > 0) ns.print("xpw disabled -- swept " + swept + " xpw threads, pool freed for income");
             }
         } catch (e) {
             ns.print("loop error: " + e);
