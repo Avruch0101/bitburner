@@ -4,12 +4,15 @@
  *  Boot order: sing -> purchaser -> sharecap(cap) -> coordinator -> (ensure hud1). hud2 stays manual.
  *
  *  usage:  run boot.js                      (defaults below)
- *          run boot.js <shareCap>           e.g. run boot.js 120000
+ *          run boot.js                      income mode: no share, no purchaser, coord 'income'
+ *          run boot.js 1000 0 repgrind      rep grind: share cap 1000, coord 'repgrind' preset
+ *          run boot.js 0 0.5 rebuild        post-install: no share, purchaser on, coord 'rebuild'
  *          run boot.js <shareCap> <noshare> e.g. run boot.js 0 1   -> skip share entirely
  *
  *  Args:
- *    [0] shareCap   -- sharecap thread cap (default SHARE_CAP). 0 with arg[1]=1 disables share.
- *    [1] noShare    -- 1 = skip sharecap (pure income/rebuild, no rep boost). default 0.
+ *    [0] shareCap   -- sharecap thread cap. DEFAULT 0 = no share (income mode). e.g. 1000 for a rep grind.
+ *    [1] purchaserFrac -- cloud purchaser spend fraction. default 0 = off.
+ *    [2] coordPreset   -- coord scenario preset. default 'income'.
  *
  *  Must be added to pull.js. @param {NS} ns */
 export async function main(ns) {
@@ -17,15 +20,22 @@ export async function main(ns) {
 
     // ---- config ----
     // Args (positional):
-    //   [0] shareCap       sharecap thread cap. default 120000. 0 = NO share.
+    //   [0] shareCap       sharecap thread cap. DEFAULT 0 = NO share (income mode -- the normal state).
+    //                      Set a number to enable faction-rep share, e.g. `run boot.js 1000` for a rep
+    //                      grind. 1000 is the standard cap (share saturates fast; more just eats pool).
+    //                      WARNING: share is a SEPARATE script and ignores coord's home reserve, so an
+    //                      uncapped/huge value (e.g. the old 120000) lets it swallow ~all of home+pool.
     //   [1] purchaserFrac  cloud purchaser spend fraction. default 0 = purchaser OFF.
     //                      >0 enables purchaser at that frac (e.g. 0.5). Cloud doesn't persist
     //                      install AND spends cash, so it's OFF by default -- opt in deliberately.
     //   [2] coordPreset    coordinator scenario preset. default 'income' (post-install earning mode).
     //                      Any coord preset works: income | rebuild | repgrind | digheavy | safe.
-    //                      e.g. `run boot.js 120000 0 rebuild` -> share on, no purchaser, coord in rebuild mode.
-    //                      Note: if you want share for a rep grind, pair it with the 'repgrind' coord preset.
-    const SHARE_CAP      = ns.args[0] !== undefined ? Number(ns.args[0]) : 120000;  // 0 disables share
+    //   Examples:
+    //     run boot.js                      -> income mode: no share, no purchaser, coord 'income'
+    //     run boot.js 1000 0 repgrind      -> rep grind: share cap 1000, coord 'repgrind'
+    //     run boot.js 0 0.5 rebuild        -> post-install rebuild: no share, purchaser on, coord 'rebuild'
+    const SHARE_CAP      = ns.args[0] !== undefined ? Number(ns.args[0]) : 0;        // 0 = NO share (default)
+    const SHARE_HOME_RES = 4096;          // GB of home RAM sharecap must leave free (so it can't eat home)
     const PURCHASER_FRAC = ns.args[1] !== undefined ? Number(ns.args[1]) : 0;        // 0 = purchaser off
     const COORD_PRESET   = ns.args[2] !== undefined ? String(ns.args[2]) : "income"; // coord scenario preset
     const PURCHASER_RES  = 500_000;   // purchaser cash floor (only used if purchaser enabled)
@@ -64,8 +74,8 @@ export async function main(ns) {
     if (SHARE_CAP <= 0) {
         log("share SKIPPED (shareCap 0)");
     } else {
-        pid = ns.run("sharecap.js", 1, SHARE_CAP);
-        log(pid ? ("sharecap.js up (cap " + SHARE_CAP + "t) -- claims its slice before coord") : "sharecap.js FAILED");
+        pid = ns.run("sharecap.js", 1, SHARE_CAP, SHARE_HOME_RES);
+        log(pid ? ("sharecap.js up (cap " + SHARE_CAP + "t, home reserve " + SHARE_HOME_RES + "GB) -- claims its slice before coord") : "sharecap.js FAILED");
         await ns.sleep(SETTLE_MS);   // let sharecap deploy its workers before coord scans the pool
     }
 
