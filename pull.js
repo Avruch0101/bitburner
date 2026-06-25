@@ -20,7 +20,10 @@ export async function main(ns) {
   const REPO = "bitburner";
   const BRANCH = "main";
   const NOKILL = ns.args[0] === "nokill";
-  // pull.js is fetched LAST: a running script can't reload its own code.
+  // pull.js is NOT in this list: a running script cannot overwrite its own file (the write is
+  // deferred and discarded on reload), which made pull.js perpetually report itself as "changed."
+  // To update pull.js itself, run `update-pull.js` (a separate script -- pull.js isn't running then,
+  // so the write lands cleanly). update-pull.js IS pulled here so it stays current.
   const files = [
     "coordinator.js", "prep.js", "h.js", "boot.js",
     "farm-status.js", "status.js", "hud.js",
@@ -33,7 +36,7 @@ export async function main(ns) {
     "batch-math.js", "batch-live.js", "sharecap.js",
     "bhack.js", "bgrow.js", "bweaken.js",
     "bprep.js", "bdiag.js", "bbatch.js",
-    "pull.js", "killfarm.js", "bbatch2.js", "xpw.js"
+    "killfarm.js", "bbatch2.js", "xpw.js", "update-pull.js"
   ];
   const base = "https://raw.githubusercontent.com/" + USER + "/" + REPO + "/" + BRANCH + "/";
 
@@ -75,14 +78,13 @@ export async function main(ns) {
     + (changed.length ? "  [" + changed.join(", ") + "]" : ""));
 
   if (NOKILL) {
-    if (needReload.length) ns.tprint("RELOAD to apply (running/self-update): " + needReload.join(", "));
+    if (needReload.length) ns.tprint("RELOAD to apply (these were running): " + needReload.join(", "));
     else ns.tprint("no reload needed -- changed files compile fresh on next run.");
   } else {
-    // after a kill-all, every file landed except pull.js's own self-update (we're still running).
-    const pullChanged = changed.includes("pull.js");
-    ns.tprint("ALL SCRIPTS KILLED + files updated on disk."
-      + (pullChanged ? " pull.js changed -> RELOAD to finish its self-update, then `run boot.js`."
-                     : " RELOAD (optional) then `run boot.js` to restart the stack."));
+    // after a kill-all, every file is unlocked when written, so all changes land on disk now.
+    // pull.js isn't in the list (can't self-update), so NO reload is needed at all.
+    ns.tprint("ALL SCRIPTS KILLED + files updated on disk. No reload needed -- `run boot.js` to restart the stack."
+      + " (To update pull.js itself, run update-pull.js.)");
   }
 }
 
